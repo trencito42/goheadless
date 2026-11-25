@@ -1,6 +1,6 @@
 # PROGRESS
 
-Last updated: 2026-11-25.
+Last updated: 2026-11-25 (RBAC pass).
 
 This tracks exactly what's real. "VERIFIED" means it was actually run and
 observed to work in this environment — not inferred from the code
@@ -65,6 +65,44 @@ short_text, body: long_text), created and published an entry via curl,
 then confirmed the same project/content-type/entry round-trip through the
 actual browser UI, including creating a second entry from the UI itself.
 
+## RBAC — IMPLEMENTED and VERIFIED (migrations/0002_rbac.sql)
+
+Added `project_members` (project_id, user_id, role), four roles ranked
+viewer < author < editor < administrator (`internal/authorization`).
+Global owners (`users.is_owner`) bypass membership entirely and are
+always treated as administrator. There is still no public registration;
+owner-only routes (`POST/GET /api/v1/manage/users`) are the whole "invite
+a collaborator" flow — the owner creates the account directly with a
+password, then adds them to a project with a role. No invite email, no
+self-service signup.
+
+Enforcement, by route:
+- `POST /manage/projects` (create) and `/manage/users` — owner-only.
+- `GET /manage/projects` — self-filters: owner sees every project,
+  everyone else sees only projects they're a member of.
+- `/manage/projects/{id}/members` — administrator.
+- `/manage/projects/{id}/content-types` — read: viewer; write: administrator.
+- `/manage/projects/{id}/content/{collection}` — read: viewer; create:
+  author; update/publish/unpublish: editor.
+- Delivery API (`/api/v1/projects/{id}/content/...`) — viewer.
+- A non-member and a too-low-role member get the identical 403 — project
+  membership itself isn't distinguishable from "action not allowed", so a
+  project id can't be probed to learn whether it exists.
+
+Verified in this session with curl: non-owner blocked from owner-only
+routes (403); non-member blocked from a project's routes (403) and sees
+an empty project list; after being added as viewer, can read but not
+write (403 on create); after being upgraded to editor, can create and the
+entry's `created_by` is correctly attributed to them.
+
+Not done: no UI for member management yet (API only — the admin frontend
+has no page for it); no field-level permissions; no "author can only
+edit their own entries" check (author can create, but update/publish
+require editor regardless of who created the entry — simpler for now,
+tracked as a real gap, not an oversight); no cross-project access test
+*suite* (verified manually via curl this session, not via automated
+tests — see "Tests" below, which is still the biggest real gap).
+
 ## Known gaps / explicitly NOT_STARTED (tracked, not forgotten)
 
 Everything below is real scope from the original spec that this session
@@ -75,9 +113,10 @@ did not implement. None of it is silently dropped — it's the next work.
   Missing: big_integer, float (separate from decimal), color, slug/UID,
   multi-select, single/multiple media, relation, component, repeatable
   component, dynamic zone, field groups, schema presets.
-- **Multi-project isolation**: projects exist, but there is no RBAC yet —
-  every authenticated user can see every project. No row-level security,
-  no per-project roles/collaborators, no cross-project access tests.
+- **Row-level security**: isolation is enforced in application code (every
+  query scoped by project_id + the new role middleware), not at the
+  database level. No Postgres RLS policies yet — see PROGRESS.md's
+  "exact next steps" below.
 - **Schema migrations**: content types can be created but not edited
   (rename/remove field, change type, etc.) or migrated. No migration plan
   generation, no destructive-change confirmation flow.
@@ -108,16 +147,17 @@ did not implement. None of it is silently dropped — it's the next work.
 
 ## Exact next steps
 
-1. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
-   verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
-   build and run.
-2. Add RBAC: roles (Owner/Project Administrator/Editor/Author/Viewer),
-   enforce project membership on every route, add cross-project access
-   tests before adding anything else security-sensitive.
-3. Extend the schema engine: relations first (needed by almost everything
+1. Add a real test suite (Go `testing` + a real Postgres, Vitest for the
+   frontend) — now the most urgent gap. RBAC in particular was only
+   verified by hand this session; it needs automated regression tests
+   (especially cross-project access and role-floor tests) before the
+   surface area grows any further, or a future change could silently
+   reopen one of these checks.
+2. Extend the schema engine: relations next (needed by almost everything
    else — components, dynamic zones, and the query engine's expansion all
    depend on it), then media (single/multiple media fields need the media
    library to exist first).
-4. Add a real test suite (Go `testing` + a real Postgres in CI, Vitest for
-   the frontend) before the surface area gets any bigger — right now
-   regressions would be invisible.
+3. Admin UI for member management (currently API-only).
+4. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
+   verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
+   build and run.

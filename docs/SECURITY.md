@@ -19,10 +19,23 @@ Current state, plainly. See PROGRESS.md for what's planned vs. built.
   `bootstrap-owner` CLI subcommand, which refuses to run if any user
   already exists.
 
+## RBAC
+
+Per-project roles (viewer < author < editor < administrator) in
+`internal/authorization`, enforced per-route in `internal/http/router.go`.
+Global owners bypass membership checks. No public registration — the
+owner creates accounts directly (`POST /api/v1/manage/users`, owner-only)
+and adds them to projects with a role. A non-member and a too-low-role
+member get an identical 403, so project existence can't be probed by a
+member who isn't authorized for it. See PROGRESS.md for exactly what was
+verified and what's still missing (field-level permissions, "edit only
+your own entries" for authors, automated tests).
+
 ## Known gaps (not yet addressed)
 
-- No RBAC: every authenticated user can read/write every project right
-  now. No per-project roles, no field-level permissions.
+- No field-level permissions, and authors can create entries but editing/
+  publishing requires editor regardless of who created the entry (no
+  "own entries only" restriction yet).
 - No rate limiting or brute-force protection on login.
 - No MFA, no password reset flow, no login history / audit log.
 - No API tokens yet (everything is session-cookie-only).

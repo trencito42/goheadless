@@ -50,6 +50,14 @@ func (s *Service) BootstrapOwner(ctx context.Context, email, password string) (U
 	return s.createUser(ctx, email, password, true)
 }
 
+// CreateUser creates a non-owner account. There is no public
+// registration; this is only reachable through an owner-gated route
+// (see internal/http/router.go), which is the entire invitation flow
+// for now — see PROGRESS.md for the real invite flow this stands in for.
+func (s *Service) CreateUser(ctx context.Context, email, password string) (User, error) {
+	return s.createUser(ctx, email, password, false)
+}
+
 func (s *Service) createUser(ctx context.Context, email, password string, isOwner bool) (User, error) {
 	hash, err := HashPassword(password)
 	if err != nil {
@@ -129,6 +137,27 @@ func (s *Service) Authenticate(ctx context.Context, sessionID uuid.UUID) (User, 
 		return User{}, fmt.Errorf("lookup session: %w", err)
 	}
 	return u, nil
+}
+
+// ListUsers is owner-only (gated in the router) — it exists so an owner
+// can look up a user's id by email before adding them to a project.
+func (s *Service) ListUsers(ctx context.Context) ([]User, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, email, is_owner, created_at FROM users ORDER BY created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("list users: %w", err)
+	}
+	defer rows.Close()
+
+	var out []User
+	for rows.Next() {
+		var u User
+		if err := rows.Scan(&u.ID, &u.Email, &u.IsOwner, &u.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan user: %w", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 func (s *Service) Logout(ctx context.Context, sessionID uuid.UUID) error {

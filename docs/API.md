@@ -11,10 +11,24 @@ yet — this is the hand-written source of truth until that lands.
 - `POST /api/v1/auth/logout` — clears the session.
 - `GET /api/v1/auth/me` — 401 if not authenticated, else the current user.
 
-## Management API (authenticated; sees drafts)
+## Users (owner-only — no public registration)
 
-- `POST /api/v1/manage/projects/` — `{name, slug}`.
-- `GET /api/v1/manage/projects/`.
+- `POST /api/v1/manage/users/` — `{email, password}` → creates a
+  non-owner account. The whole "invite a collaborator" flow for now: no
+  invite email, the owner sets the password directly.
+- `GET /api/v1/manage/users/` — list users (to find an id for the members
+  endpoint below).
+
+## Management API (authenticated + project-role-gated; see docs/SECURITY.md)
+
+- `POST /api/v1/manage/projects/` — `{name, slug}`. Owner-only.
+- `GET /api/v1/manage/projects/` — owner sees all; everyone else sees
+  only projects they're a member of.
+- `GET/POST /api/v1/manage/projects/{projectID}/members/` —
+  `{userId, role}`, role one of `viewer|author|editor|administrator`.
+  Administrator required.
+- `DELETE /api/v1/manage/projects/{projectID}/members/{userID}` —
+  administrator required.
 - `POST /api/v1/manage/projects/{projectID}/content-types/` —
   `{apiId, displayName, kind, schema: {fields: [...]}}`.
 - `GET /api/v1/manage/projects/{projectID}/content-types/`.
@@ -34,10 +48,10 @@ yet — this is the hand-written source of truth until that lands.
 - `GET /api/v1/projects/{projectID}/content/{collection}/{documentID}` —
   query: `locale`.
 
-Currently still gated behind a session (anonymous published-content
-access is planned but not implemented — see PROGRESS.md). No field
-selection, relation expansion, filter operators, or cursor pagination
-yet; only `limit`/`offset`.
+Currently still gated behind viewer-or-above project membership
+(anonymous published-content access is planned but not implemented — see
+PROGRESS.md). No field selection, relation expansion, filter operators,
+or cursor pagination yet; only `limit`/`offset`.
 
 ## Schema field types
 

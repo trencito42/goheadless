@@ -7,6 +7,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+
+	"github.com/stefan10xdd/strapi-killer/internal/auth"
 	httpx "github.com/stefan10xdd/strapi-killer/internal/httpx"
 )
 
@@ -40,7 +42,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	e, err := h.svc.Create(r.Context(), projectID, apiID, req.Locale, req.Data)
+	user, ok := auth.RequireUser(w, r)
+	if !ok {
+		return
+	}
+	e, err := h.svc.Create(r.Context(), projectID, apiID, req.Locale, user.ID, req.Data)
 	if err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return

@@ -30,6 +30,7 @@ type Entry struct {
 	Status        string         `json:"status"`
 	Data          map[string]any `json:"data"`
 	Version       int            `json:"version"`
+	CreatedBy     *uuid.UUID     `json:"createdBy,omitempty"`
 	CreatedAt     time.Time      `json:"createdAt"`
 	UpdatedAt     time.Time      `json:"updatedAt"`
 }
@@ -52,8 +53,8 @@ func (s *Service) resolveContentType(projectID uuid.UUID, apiID string) (schema.
 }
 
 // Create validates data against the content type's active schema and
-// inserts a new draft document.
-func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale string, data map[string]any) (Entry, error) {
+// inserts a new draft document, attributed to createdBy.
+func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale string, createdBy uuid.UUID, data map[string]any) (Entry, error) {
 	ct, err := s.resolveContentType(projectID, apiID)
 	if err != nil {
 		return Entry{}, err
@@ -73,11 +74,11 @@ func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale
 
 	var e Entry
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO entries (project_id, content_type_id, document_id, locale, status, data)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, project_id, content_type_id, document_id, locale, status, data, version, created_at, updated_at`,
-		projectID, ct.ID, documentID, locale, StatusDraft, dataBytes,
-	).Scan(&e.ID, &e.ProjectID, &e.ContentTypeID, &e.DocumentID, &e.Locale, &e.Status, &dataBytes, &e.Version, &e.CreatedAt, &e.UpdatedAt)
+		INSERT INTO entries (project_id, content_type_id, document_id, locale, status, data, created_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, project_id, content_type_id, document_id, locale, status, data, version, created_by, created_at, updated_at`,
+		projectID, ct.ID, documentID, locale, StatusDraft, dataBytes, createdBy,
+	).Scan(&e.ID, &e.ProjectID, &e.ContentTypeID, &e.DocumentID, &e.Locale, &e.Status, &dataBytes, &e.Version, &e.CreatedBy, &e.CreatedAt, &e.UpdatedAt)
 	if err != nil {
 		return Entry{}, fmt.Errorf("insert entry: %w", err)
 	}

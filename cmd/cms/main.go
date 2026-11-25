@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/stefan10xdd/strapi-killer/internal/auth"
+	"github.com/stefan10xdd/strapi-killer/internal/authorization"
 	"github.com/stefan10xdd/strapi-killer/internal/config"
 	"github.com/stefan10xdd/strapi-killer/internal/content"
 	httpapi "github.com/stefan10xdd/strapi-killer/internal/http"
@@ -69,6 +70,7 @@ func runServe(logger *slog.Logger) error {
 	}
 
 	authSvc := auth.NewService(pool, sessionTTL)
+	authzSvc := authorization.NewService(pool)
 	projectsSvc := projects.NewService(pool)
 	contentSvc := content.NewService(pool, registry)
 
@@ -80,6 +82,7 @@ func runServe(logger *slog.Logger) error {
 	router := httpapi.NewRouter(httpapi.Deps{
 		Logger:      logger,
 		AuthSvc:     authSvc,
+		AuthzSvc:    authzSvc,
 		ProjectsSvc: projectsSvc,
 		Registry:    registry,
 		ContentSvc:  contentSvc,

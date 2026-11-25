@@ -9,6 +9,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 
 	"github.com/stefan10xdd/strapi-killer/internal/auth"
+	"github.com/stefan10xdd/strapi-killer/internal/authorization"
 	"github.com/stefan10xdd/strapi-killer/internal/content"
 	"github.com/stefan10xdd/strapi-killer/internal/httpx"
 	"github.com/stefan10xdd/strapi-killer/internal/projects"
@@ -18,6 +19,7 @@ import (
 type Deps struct {
 	Logger      *slog.Logger
 	AuthSvc     *auth.Service
+	AuthzSvc    *authorization.Service
 	ProjectsSvc *projects.Service
 	Registry    *schema.Registry
 	ContentSvc  *content.Service
@@ -45,37 +47,63 @@ func NewRouter(d Deps) http.Handler {
 	r.Post("/api/v1/auth/logout", authHandler.Logout)
 	r.Get("/api/v1/auth/me", authHandler.Me)
 
-	projectsHandler := projects.NewHandler(d.ProjectsSvc)
+	projectsHandler := projects.NewHandler(d.ProjectsSvc, d.AuthzSvc)
 	schemaHandler := schema.NewHandler(d.Registry)
 	contentHandler := content.NewHandler(d.ContentSvc)
+	membersHandler := authorization.NewHandler(d.AuthzSvc)
+
+	requireEditor := authorization.RequireProjectRole(d.AuthzSvc, authorization.RoleEditor)
+	requireAuthor := authorization.RequireProjectRole(d.AuthzSvc, authorization.RoleAuthor)
+	requireViewer := authorization.RequireProjectRole(d.AuthzSvc, authorization.RoleViewer)
+	requireAdministrator := authorization.RequireProjectRole(d.AuthzSvc, authorization.RoleAdministrator)
+
+	// Owner-only: no public registration, no self-service project
+	// creation or user invitation. This is the whole "invite a
+	// collaborator" flow for now (see PROGRESS.md).
+	r.Route("/api/v1/manage/users", func(r chi.Router) {
+		r.Use(requireAuth, requireOwner)
+		r.Post("/", authHandler.CreateUser)
+		r.Get("/", authHandler.ListUsers)
+	})
 
 	// Management API: authenticated, operates on drafts, can publish.
+	// Every project-scoped route is additionally gated by role; a
+	// non-member gets the same 403 a too-low-role member gets.
 	r.Route("/api/v1/manage/projects", func(r chi.Router) {
 		r.Use(requireAuth)
-		r.Post("/", projectsHandler.Create)
-		r.Get("/", projectsHandler.List)
+
+		r.With(requireOwner).Post("/", projectsHandler.Create)
+		r.Get("/", projectsHandler.List) // self-filters by membership
+
+		r.Route("/{projectID}/members", func(r chi.Router) {
+			r.Use(requireAdministrator)
+			r.Get("/", membersHandler.ListMembers)
+			r.Post("/", membersHandler.AddMember)
+			r.Delete("/{userID}", membersHandler.RemoveMember)
+		})
 
 		r.Route("/{projectID}/content-types", func(r chi.Router) {
-			r.Post("/", schemaHandler.Create)
-			r.Get("/", schemaHandler.List)
+			r.With(requireAdministrator).Post("/", schemaHandler.Create)
+			r.With(requireViewer).Get("/", schemaHandler.List)
 		})
 
 		r.Route("/{projectID}/content/{collection}", func(r chi.Router) {
-			r.Post("/", contentHandler.Create)
-			r.Get("/", contentHandler.ListDrafts)
+			r.With(requireAuthor).Post("/", contentHandler.Create)
+			r.With(requireViewer).Get("/", contentHandler.ListDrafts)
 			r.Route("/{documentID}", func(r chi.Router) {
-				r.Patch("/", contentHandler.Update)
-				r.Post("/publish", contentHandler.Publish)
-				r.Post("/unpublish", contentHandler.Unpublish)
+				r.With(requireAuthor).Patch("/", contentHandler.Update)
+				r.With(requireEditor).Post("/publish", contentHandler.Publish)
+				r.With(requireEditor).Post("/unpublish", contentHandler.Unpublish)
 			})
 		})
 	})
 
 	// Delivery API: public (anonymous access is opt-in per the roadmap;
-	// for now every route in this tree still requires a session so we
-	// never accidentally expose content before access control lands).
+	// for now every route in this tree still requires at least viewer
+	// membership so we never accidentally expose content before
+	// anonymous access control is actually designed).
 	r.Route("/api/v1/projects/{projectID}/content/{collection}", func(r chi.Router) {
-		r.Use(requireAuth)
+		r.Use(requireAuth, requireViewer)
 		r.Get("/", contentHandler.ListPublished)
 		r.Get("/{documentID}", contentHandler.GetPublished)
 	})
@@ -87,6 +115,19 @@ func requireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := auth.UserFromContext(r.Context()); !ok {
 			httpx.WriteError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireOwner gates routes with no notion of project membership at all
+// (creating projects, creating/listing users). Must run after requireAuth.
+func requireOwner(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, ok := auth.UserFromContext(r.Context())
+		if !ok || !user.IsOwner {
+			httpx.WriteError(w, http.StatusForbidden, "owner access required")
 			return
 		}
 		next.ServeHTTP(w, r)

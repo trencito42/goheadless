@@ -69,6 +69,33 @@ func (s *Service) List(ctx context.Context) ([]Project, error) {
 	return out, rows.Err()
 }
 
+// ListByIDs returns the projects matching the given ids, in no
+// particular order. Used to list "my projects" for a non-owner user,
+// whose set of visible projects comes from project_members rather than
+// the projects table itself.
+func (s *Service) ListByIDs(ctx context.Context, ids []uuid.UUID) ([]Project, error) {
+	if len(ids) == 0 {
+		return []Project{}, nil
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, name, slug, created_at, updated_at FROM projects WHERE id = ANY($1) ORDER BY created_at`,
+		ids)
+	if err != nil {
+		return nil, fmt.Errorf("list projects by id: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Project
+	for rows.Next() {
+		var p Project
+		if err := rows.Scan(&p.ID, &p.Name, &p.Slug, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan project: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (s *Service) GetBySlug(ctx context.Context, slug string) (Project, error) {
 	var p Project
 	err := s.pool.QueryRow(ctx,

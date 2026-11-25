@@ -121,3 +121,36 @@ func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 		"isOwner": user.IsOwner,
 	})
 }
+
+// CreateUser and ListUsers are owner-only; the router gates them, not
+// this handler, so they assume that's already been enforced.
+
+func (h *Handler) CreateUser(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	user, err := h.svc.CreateUser(r.Context(), req.Email, req.Password)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	httpx.WriteJSON(w, http.StatusCreated, map[string]any{
+		"id":      user.ID,
+		"email":   user.Email,
+		"isOwner": user.IsOwner,
+	})
+}
+
+func (h *Handler) ListUsers(w http.ResponseWriter, r *http.Request) {
+	users, err := h.svc.ListUsers(r.Context())
+	if err != nil {
+		httpx.WriteError(w, http.StatusInternalServerError, "failed to list users")
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, users)
+}
