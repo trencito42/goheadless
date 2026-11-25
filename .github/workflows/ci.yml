@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: cms
+          POSTGRES_PASSWORD: cms_dev_password
+          POSTGRES_DB: cms_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cms"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Set explicitly (not left to the test helper's local-dev default) so
+      # the integration suite fails the build instead of skipping if this
+      # service is ever misconfigured — see PROGRESS.md "Tests".
+      TEST_DATABASE_URL: postgres://cms:cms_dev_password@localhost:5432/cms_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt needs to be run on:"
+            echo "$fmt_out"
+            exit 1
+          fi
+      - run: go test ./...
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      # Pinned to match the pnpm version this repo's pnpm-lock.yaml was
+      # generated with (see README). Not using `corepack enable` +
+      # package.json's packageManager field here: pnpm 10+ treats that as
+      # "self-manage pnpm via the lockfile" and rewrites pnpm-lock.yaml to
+      # include every platform's pnpm binary as a dependency — harmless
+      # but a lot of unrelated lockfile churn for no benefit in CI.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "12.21.0"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:design-system
+      - run: pnpm --filter admin typecheck
+      - run: pnpm --filter admin build

@@ -32,7 +32,18 @@ compiling.
   `pnpm approve-builds` — needs an interactive terminal, can't be
   automated from a non-TTY tool call).
 - `apps/admin` typechecks clean (`tsc -b --noEmit`). VERIFIED.
-- No CI pipeline yet. NOT_STARTED.
+- CI: `.github/workflows/ci.yml` — IMPLEMENTED, **unverified by an actual
+  Actions run** (this environment has no `gh` CLI and no way to trigger
+  or observe GitHub Actions directly; it's pushed and will run on GitHub
+  on the next push/PR, but "the YAML is correct" and "the workflow
+  passed on GitHub" are different claims — only the first is backed by
+  anything done in this session). Two jobs: `backend` (Postgres 17
+  service container, `go build`/`vet`/`gofmt -l`/`test ./...` with
+  `TEST_DATABASE_URL` set explicitly — which is exactly the case the
+  test-skip-vs-fail fix above is for) and `frontend` (`pnpm install
+  --frozen-lockfile`, design-system build, `tsc` typecheck, `vite
+  build`). Next person to push should confirm it actually goes green on
+  GitHub and fix anything this local-only review couldn't catch.
 - No ADRs written yet (docs/adr/ is empty). NOT_STARTED.
 
 ## Phase 1 — First vertical slice: IMPLEMENTED and VERIFIED end-to-end
@@ -291,9 +302,6 @@ did not implement. None of it is silently dropped — it's the next work.
 5. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
    verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
    build and run.
-6. Wire CI (even a minimal GitHub Actions workflow running `go test ./...`
-   against a Postgres service container, plus the frontend typecheck) —
-   there isn't one yet, so none of the above is enforced automatically.
-   Since CI would set `TEST_DATABASE_URL` explicitly, the integration
-   suite now fails the build (rather than skipping) if that database is
-   unreachable there — see the Tests section above.
+6. `.github/workflows/ci.yml` now exists (see Phase 0 above) but its
+   first real run on GitHub hasn't been observed from this environment
+   — confirm it's actually green, not just plausible-looking YAML.
