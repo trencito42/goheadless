@@ -95,6 +95,7 @@ func NewRouter(d Deps) http.Handler {
 				r.With(requireAuthor).Patch("/", contentHandler.Update)
 				r.With(requireEditor).Post("/publish", contentHandler.Publish)
 				r.With(requireEditor).Post("/unpublish", contentHandler.Unpublish)
+				r.With(requireEditor).Delete("/", contentHandler.Delete)
 			})
 		})
 	})

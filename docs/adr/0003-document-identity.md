@@ -73,12 +73,24 @@ it surfaces as an ordinary unique-violation that
 than a raw database error leaking through.
 
 `many_to_one` and `many_to_many` get no such constraint, correctly —
-many sources may point at the same target. `one_to_many` similarly
-gets none on this axis (its "many" side is the list a to-many field
-already enforces by shape; nothing stops many *different* one_to_many
-fields, or the same field from different source documents, from
-pointing into the same set of targets, which is correct for that
-relation type).
+many sources may point at the same target.
+
+> **Correction (see ADR 0004)**: the paragraph originally here claimed
+> `one_to_many` also needed no reverse-uniqueness constraint. That was
+> wrong: `one_to_many`'s "one" side is exactly as exclusive as
+> `one_to_one`'s — a target can belong to at most one parent through a
+> given `one_to_many` field — and migrations/0004's index only covered
+> `one_to_one`, leaving `one_to_many` with no DB-enforced reverse
+> uniqueness at all. ADR 0004 extends the index to cover both. Left
+> here rather than silently fixed, same as ADR 0002's correction above
+> it in the history.
+>
+> That same audit also found the index as shipped here was keyed by
+> `(field_id, to_document_id)` with no `locale` — which meant two
+> locale variants of the *same* document both publishing to the same
+> target looked identical to two different documents claiming it, and
+> was wrongly rejected. ADR 0004 adds `locale` to `entry_relations` and
+> scopes the index by it.
 
 ## Consequences
 

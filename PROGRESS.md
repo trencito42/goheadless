@@ -34,25 +34,26 @@ compiling.
   `pnpm approve-builds` — needs an interactive terminal, can't be
   automated from a non-TTY tool call).
 - `apps/admin` typechecks clean (`tsc -b --noEmit`). VERIFIED.
-- CI: `.github/workflows/ci.yml` — IMPLEMENTED, **unverified by an actual
-  Actions run** (this environment has no `gh` CLI and no way to trigger
-  or observe GitHub Actions directly; it's pushed and will run on GitHub
-  on the next push/PR, but "the YAML is correct" and "the workflow
-  passed on GitHub" are different claims — only the first is backed by
-  anything done in this session). Two jobs: `backend` (Postgres 17
-  service container, `go build`/`vet`/`gofmt -l`/`test ./...` with
-  `TEST_DATABASE_URL` set explicitly — which is exactly the case the
-  test-skip-vs-fail fix above is for) and `frontend` (`pnpm install
-  --frozen-lockfile`, design-system build, `tsc` typecheck, `vite
-  build`). Next person to push should confirm it actually goes green on
-  GitHub and fix anything this local-only review couldn't catch. Now
-  also runs `go test -race ./...` on this Linux job specifically,
-  since the Windows machine this project is otherwise developed on has
-  no C compiler for cgo (see Tests below) — Linux runners ship gcc, so
-  this is the one place `-race` actually runs, not a second skip.
-- `docs/adr/` — stale note removed: three ADRs exist (0001 hybrid
-  storage, 0002 relations, 0003 document identity/relation integrity),
-  not zero.
+- CI: `.github/workflows/ci.yml` — IMPLEMENTED and, as of commit
+  `3ae25cc`, **confirmed green on an actual GitHub Actions run** (this
+  environment still has no `gh` CLI and can't observe Actions directly;
+  the pass was confirmed externally, not by anything run from this
+  session — noted plainly since "the YAML is correct" and "the
+  workflow passed on GitHub" were, until now, different claims). Two
+  jobs: `backend` (Postgres 17 service container,
+  `go build`/`vet`/`gofmt -l`/`test ./...` with `TEST_DATABASE_URL` set
+  explicitly — which is exactly the case the test-skip-vs-fail fix
+  above is for) and `frontend` (`pnpm install --frozen-lockfile`,
+  design-system build, `tsc` typecheck, `vite build`). Every commit
+  after `3ae25cc` should still get its own confirmation rather than
+  assuming green stays green. Now also runs `go test -race ./...` on
+  this Linux job specifically, since the Windows machine this project
+  is otherwise developed on has no C compiler for cgo (see Tests
+  below) — Linux runners ship gcc, so this is the one place `-race`
+  actually runs, not a second skip.
+- `docs/adr/` — stale note removed: four ADRs exist (0001 hybrid
+  storage, 0002 relations, 0003 document identity/relation integrity,
+  0004 field-id backfill/cardinality/deletion-policy), not zero.
 
 ## Phase 1 — First vertical slice: IMPLEMENTED and VERIFIED end-to-end
 
@@ -129,7 +130,7 @@ anyone's, unchanged. VERIFIED by
 different author-role users plus an editor-promoted one, against real
 Postgres).
 
-## Relations — IMPLEMENTED and VERIFIED (migrations/0003, 0004)
+## Relations — IMPLEMENTED and VERIFIED (migrations/0003, 0004, 0005)
 
 A `relation` field type (`one_to_one`, `one_to_many`, `many_to_one`,
 `many_to_many`), stored in a dedicated `entry_relations` table rather
@@ -138,14 +139,18 @@ both `entries.document_id` and `entry_relations.to_document_id` with
 foreign keys. Full design rationale in `docs/adr/0002-relations.md` and
 `docs/adr/0003-document-identity.md`; API shape in `docs/API.md`.
 
-- Schema: `schema.RelationConfig` (`targetContentType`, `relationType`),
-  validated structurally (`Definition.Validate`) and by value shape
-  (`validateRelationValue` — a single document-id string for to-one, a
-  list of them for to-many). Every field (not just relations) now also
-  carries a stable `schema.Field.ID`, assigned once at creation and
-  never changed — `entry_relations` is keyed by this, not by the
-  field's display name, so a future field rename (schema migrations
-  are still NOT_STARTED) won't orphan stored relations.
+- Schema: `schema.RelationConfig` (`targetContentType`, `relationType`,
+  optional `onDelete`), validated structurally (`Definition.Validate`)
+  and by value shape (`validateRelationValue` — a single document-id
+  string for to-one, a list of them for to-many). Every field (not just
+  relations) now also carries a stable `schema.Field.ID`, assigned once
+  at creation and never changed — `entry_relations` is keyed by this,
+  not by the field's display name, so a future field rename (schema
+  migrations are still NOT_STARTED) won't orphan stored relations.
+  migrations/0005 backfills an id for any field that somehow still
+  lacks one, and `Definition.Validate` now rejects two fields sharing a
+  client-supplied id (an independent audit finding — stored-relation
+  lookups keyed by field id would otherwise be ambiguous between them).
 - Registry: creating a content type with a relation field checks the
   target content type exists in the **same project** (or is the type
   being created itself, for self-reference) before accepting it.
@@ -153,12 +158,32 @@ foreign keys. Full design rationale in `docs/adr/0002-relations.md` and
   (fixed in an independent audit of the original relations work):
   `documents` is one row per `document_id`; `entries.document_id` and
   `entry_relations.to_document_id` are real foreign keys to it, both
-  `ON DELETE CASCADE`. There is still no "delete a document" API, so
-  this cascade isn't reachable through the HTTP API yet, but it's
-  VERIFIED directly against the database by
+  `ON DELETE CASCADE`. migrations/0005 adds composite `UNIQUE (id,
+  project_id[, content_type_id])` on `documents` plus composite foreign
+  keys from `entries`/`entry_relations` against them, so Postgres
+  itself now rejects a write tagging an entries/relations row with a
+  document from the wrong project or content type — not just
+  application code. VERIFIED directly against the database by
   `TestDocumentDeletionCascadesToEntriesAndRelations` (delete a
   `documents` row → its own entries rows and any relation pointing at
-  it both disappear, with no application code needed).
+  it both disappear, with no application code needed) and, through the
+  actual HTTP API this time, by the `DELETE .../content/{collection}/
+  {documentID}` endpoint below.
+- **Document deletion with explicit per-field policies**:
+  `Service.DeleteDocument` (`internal/content/delete.go`), exposed as
+  `DELETE /api/v1/manage/projects/{projectID}/content/{collection}/
+  {documentID}` (editor role or above) — the "delete a document" API
+  that was a known gap through the last two sessions. A relation
+  field's `onDelete` (`schema.DeletePolicy`: `restrict` — the default
+  when unset, `set_null`, or `cascade`) governs what happens to
+  documents still referencing the one being deleted: `restrict` aborts
+  the whole deletion (409 `ErrDocumentReferenced`) if any reference
+  exists at all; `set_null` lets it proceed (the FK cascade removes the
+  dangling `entry_relations` rows); `cascade` lets it proceed and also
+  deletes every referencing document, recursively, cycle-safely, all in
+  one transaction. VERIFIED by `TestDeleteDocumentRestrictPolicyBlocksDeletion`,
+  `TestDeleteDocumentSetNullPolicyClearsReference`, and
+  `TestDeleteDocumentCascadePolicyDeletesReferencingDocument`.
 - Content service: relation values are split out of the submitted
   `data` before it's stored as JSONB (`splitRelationFields`), validated
   against the real `entries` table — target must exist, belong to the
@@ -184,6 +209,15 @@ foreign keys. Full design rationale in `docs/adr/0002-relations.md` and
 - Reads (`List`/`Get`) batch-load every entry's relations in one query
   (`attachRelations`, keyed by a batch of row ids — never one query per
   entry), returning bare document-id stub(s) by default.
+  **Snapshot-consistent**: the entries query and every relation-reading
+  step (`attachRelations`/`filterUndeliverableTargets`/`expandIncludes`)
+  now run inside one `REPEATABLE READ`, read-only transaction, not as
+  four independent statements against the pool — an audit finding:
+  without it, a publish landing in the gap between two of those four
+  queries could produce a response combining an entries row from
+  before that publish with relation/included data from after it (or
+  vice versa), a state that was never actually true at any single
+  instant.
 - **Delivery reads never deliver an unpublished target's id**: a
   published entry's relation stub is checked against which of its
   referenced documents actually have a published row *in the requested
@@ -215,19 +249,26 @@ foreign keys. Full design rationale in `docs/adr/0002-relations.md` and
   source documents reference the same target — that was always correct
   and is now explicitly regression-tested
   (`TestManyToOneAllowsMultipleSourcesToSameTarget`), not just assumed.
-  `one_to_one` reverse-uniqueness ("at most one document may claim this
-  target through this field") is now a **real, race-free database
-  constraint** — a partial unique index scoped to `status = 'published'`
-  (so a document's own draft+published rows legitimately sharing a
-  target, which is what publishing *is*, doesn't self-conflict; two
-  different documents' *drafts* may transiently both point at the same
-  target, with the conflict becoming real only once one of them
-  publishes). A violation surfaces as a 409 (`ErrRelationConflict`), not
-  a raw database error. VERIFIED by
-  `TestOneToOneRejectsSecondPublishedReferenceButAllowsConcurrentDrafts`.
-  Full rationale, including why the earlier version of this paragraph
-  was wrong to lump `many_to_one` in with this gap, is in
-  `docs/adr/0003-document-identity.md`.
+  `one_to_one` **and `one_to_many`** reverse-uniqueness ("at most one
+  document may claim this target through this field") is a **real,
+  race-free, locale-scoped database constraint** — a partial unique
+  index on `(field_id, to_document_id, locale)` scoped to `status =
+  'published'` (so a document's own draft+published rows legitimately
+  sharing a target, which is what publishing *is*, doesn't self-conflict;
+  two different documents' *drafts* may transiently both point at the
+  same target, with the conflict becoming real only once one of them
+  publishes) and scoped by `locale` (migrations/0005 — without it, two
+  locale variants of the *same* document both publishing to the same
+  target looked identical to two *different* documents claiming it, and
+  was wrongly rejected; `one_to_many` originally had no reverse-uniqueness
+  constraint at all — migrations/0004 only covered `one_to_one`). A
+  violation surfaces as a 409 (`ErrRelationConflict`), not a raw
+  database error. VERIFIED by
+  `TestOneToOneRejectsSecondPublishedReferenceButAllowsConcurrentDrafts`,
+  `TestOneToOneLocaleVariantsOfSameDocumentDontConflict`, and
+  `TestOneToManyReverseCardinality`. Full rationale, including the
+  corrections to earlier ADRs, is in `docs/adr/0003-document-identity.md`
+  and `docs/adr/0004-field-id-backfill-cardinality-deletion-policy.md`.
 - Cross-project relation targets are rejected — not just checked, but
   structurally impossible, since the target content type is always
   resolved through `registry.Get(callerProjectID, ...)`, so there is no
@@ -237,25 +278,28 @@ foreign keys. Full design rationale in `docs/adr/0002-relations.md` and
   VERIFIED by `TestRelationSelfReferencingAndToMany`.
 
 VERIFIED end-to-end against real Postgres in
-`tests/integration/relations_test.go` (15 tests covering everything
+`tests/integration/relations_test.go` (17 tests covering everything
 above — create/fetch with a stub and an expanded relation,
 cross-project rejection, self-reference + to-many, draft/published
 snapshot independence, author ownership, private-field redaction,
 many_to_one multi-source, one_to_one conflict + concurrent-drafts
-allowance, unpublished-target filtering, locale-aware expansion, and
-document-deletion cascade).
+allowance, one_to_one locale-variant non-conflict, one_to_many reverse
+cardinality, unpublished-target filtering, locale-aware expansion,
+document-deletion cascade, all three deletion policies, and the
+concurrent-publish-vs-update lock) plus `internal/schema/schema_test.go`
+(duplicate field id and onDelete-policy validation).
 
-**Known gap, still not solved**: a genuine *concurrency* regression
-test (two goroutines racing `Update`/`Publish` against the same
-document to prove the `FOR UPDATE` lock actually serializes them, not
-just that the code calls it) was not written in this pass — writing a
-deterministic one needs controlled timing/goroutine orchestration that
-didn't fit this session's scope. The lock's correctness is argued from
-reading the code and from Postgres's documented row-lock semantics, not
-from a race test. Also still not done: components, dynamic zones
-(relations were the prerequisite for both; now unblocked); "delete a
-document" has no API yet, so the cascade FKs above are verified at the
-database level but not reachable through HTTP.
+**Former known gap, now closed**: a genuine *concurrency* regression
+test for `Publish`'s `FOR UPDATE` lock —
+`TestConcurrentPublishBlocksUpdateUntilCommit` holds that exact lock
+itself via a raw SQL transaction and asserts a concurrent `Update`
+blocks the entire time the lock is held, only completing once it's
+released, deterministically (no sleep-and-hope timing: it asserts
+non-completion within a bounded wait, then waits unboundedly for
+completion after releasing the lock). The lock's correctness is no
+longer argued from code review alone. Still not done: components,
+dynamic zones (relations were the prerequisite for both; now
+unblocked).
 
 ## Tests — now real, IMPLEMENTED and VERIFIED
 
@@ -273,7 +317,7 @@ database level but not reachable through HTTP.
   visibility), schema validation rejecting missing/unexpected fields
   through the real HTTP path, owner-only routes rejecting a non-owner,
   the RBAC suite (cross-project isolation, viewer/editor role floor,
-  `created_by` attribution), and the full relations suite (15 tests —
+  `created_by` attribution), and the full relations suite (17 tests —
   see the "Relations" section above for what each one covers).
 - **Fixed (independent audit finding)**: the test harness used to
   `t.Skip` whenever it couldn't reach the test database, with no
@@ -321,11 +365,15 @@ did not implement. None of it is silently dropped — it's the next work.
 - **Schema migrations**: content types can be created but not edited
   (rename/remove field, change type, etc.) or migrated. No migration plan
   generation, no destructive-change confirmation flow.
-- **Relations**: implemented, including document identity/FK integrity,
-  correct cardinality (including DB-enforced one_to_one
-  reverse-uniqueness), locale-aware expansion, and unpublished-target
-  filtering (see the dedicated section above). The one remaining gap
-  there is a real concurrency regression test, not a missing feature.
+- **Relations**: implemented, including document identity/FK integrity
+  (now with composite project/content-type consistency constraints),
+  correct and locale-aware cardinality (DB-enforced reverse-uniqueness
+  for both `one_to_one` and `one_to_many`), snapshot-consistent reads,
+  unpublished-target filtering, document deletion with explicit
+  restrict/set_null/cascade policies, and a deterministic concurrency
+  regression test for the publish lock (see the dedicated section
+  above). No known gaps remain in this area beyond the field-type and
+  localization scope tracked elsewhere on this list.
   **Components, dynamic zones**: still not implemented at all
   (relations were a prerequisite for both; now unblocked).
 - **Localization**: `locale` column exists and is threaded through, but
@@ -356,28 +404,25 @@ did not implement. None of it is silently dropped — it's the next work.
 ## Exact next steps
 
 1. Components and dynamic zones next (relations, their prerequisite, are
-   now done — including the integrity hardening an independent audit
-   asked for), then media (single/multiple media fields need the media
-   library to exist first). Use `schema.Field.ID` for their own nested
-   field identity from the start, not display names, for the same
-   rename-safety reason relations now do. Add integration tests as
-   they're built, following the pattern in `tests/integration/`, not
-   after.
-2. Admin UI: no relations UI yet (picking a related entry, seeing
+   now done — including two full rounds of integrity hardening an
+   independent audit asked for), then media (single/multiple media
+   fields need the media library to exist first). Use
+   `schema.Field.ID` for their own nested field identity from the
+   start, not display names, for the same rename-safety reason
+   relations now do, and think about their own deletion-policy story
+   rather than inheriting relations' answer by default (see ADR 0004).
+   Add integration tests as they're built, following the pattern in
+   `tests/integration/`, not after.
+2. A schema migration engine: content types can be created but not
+   edited (rename/remove field, change type) or migrated — no
+   migration plan generation, no destructive-change confirmation flow.
+   Should build on `schema.Field.ID` (fields already survive a rename
+   at the storage layer; there's just no API to perform one yet).
+3. Admin UI: no relations UI yet (picking a related entry, seeing
    expanded relations), no member-management UI (currently API-only).
    Both API-only today, both real gaps.
-3. A real concurrency regression test for `Publish`'s `FOR UPDATE` lock
-   (two goroutines racing `Update`/`Publish` against the same document)
-   — the known gap called out at the end of the Relations section.
-4. A "delete a document" API — the FK cascades added in
-   migrations/0004 are verified at the database level
-   (`TestDocumentDeletionCascadesToEntriesAndRelations`) but there's
-   nothing in the HTTP API that reaches them yet.
-5. Install a C compiler on this dev machine so `go test -race` can run
+4. Install a C compiler on this dev machine so `go test -race` can run
    locally too, not just in CI.
-6. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
+5. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
    verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
    build and run.
-7. `.github/workflows/ci.yml` now exists (see Phase 0 above) but its
-   first real run on GitHub hasn't been observed from this environment
-   — confirm it's actually green, not just plausible-looking YAML.

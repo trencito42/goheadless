@@ -110,7 +110,7 @@ func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale
 	if err != nil {
 		return Entry{}, fmt.Errorf("insert entry: %w", err)
 	}
-	if err := setRelations(ctx, tx, projectID, e.ID, documentID, StatusDraft, ct.Schema.RelationFields(), relationValues); err != nil {
+	if err := setRelations(ctx, tx, projectID, e.ID, documentID, locale, StatusDraft, ct.Schema.RelationFields(), relationValues); err != nil {
 		return Entry{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -120,7 +120,7 @@ func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale
 	if err := json.Unmarshal(dataBytes, &e.Data); err != nil {
 		return Entry{}, fmt.Errorf("unmarshal data: %w", err)
 	}
-	if err := s.attachRelations(ctx, projectID, ct.Schema, []Entry{e}); err != nil {
+	if err := s.attachRelations(ctx, s.pool, projectID, ct.Schema, []Entry{e}); err != nil {
 		return Entry{}, err
 	}
 	return e, nil
@@ -195,7 +195,7 @@ func (s *Service) Update(ctx context.Context, projectID uuid.UUID, apiID string,
 	if err != nil {
 		return Entry{}, fmt.Errorf("update entry: %w", err)
 	}
-	if err := setRelations(ctx, tx, projectID, e.ID, documentID, StatusDraft, ct.Schema.RelationFields(), relationValues); err != nil {
+	if err := setRelations(ctx, tx, projectID, e.ID, documentID, locale, StatusDraft, ct.Schema.RelationFields(), relationValues); err != nil {
 		return Entry{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -205,7 +205,7 @@ func (s *Service) Update(ctx context.Context, projectID uuid.UUID, apiID string,
 	if err := json.Unmarshal(scannedDataBytes, &e.Data); err != nil {
 		return Entry{}, fmt.Errorf("unmarshal data: %w", err)
 	}
-	if err := s.attachRelations(ctx, projectID, ct.Schema, []Entry{e}); err != nil {
+	if err := s.attachRelations(ctx, s.pool, projectID, ct.Schema, []Entry{e}); err != nil {
 		return Entry{}, err
 	}
 	return e, nil
@@ -285,7 +285,7 @@ func (s *Service) Publish(ctx context.Context, projectID uuid.UUID, apiID string
 	if err != nil {
 		return Entry{}, fmt.Errorf("promote to published: %w", err)
 	}
-	if err := copyRelations(ctx, tx, projectID, draftID, e.ID, documentID, StatusPublished, relFields); err != nil {
+	if err := copyRelations(ctx, tx, projectID, draftID, e.ID, documentID, locale, StatusPublished, relFields); err != nil {
 		return Entry{}, err
 	}
 
@@ -295,7 +295,7 @@ func (s *Service) Publish(ctx context.Context, projectID uuid.UUID, apiID string
 	if err := json.Unmarshal(scannedDataBytes, &e.Data); err != nil {
 		return Entry{}, fmt.Errorf("unmarshal data: %w", err)
 	}
-	if err := s.attachRelations(ctx, projectID, ct.Schema, []Entry{e}); err != nil {
+	if err := s.attachRelations(ctx, s.pool, projectID, ct.Schema, []Entry{e}); err != nil {
 		return Entry{}, err
 	}
 	return e, nil
@@ -340,7 +340,22 @@ func (s *Service) List(ctx context.Context, projectID uuid.UUID, apiID, status, 
 		limit = 20
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	// A single read-only, REPEATABLE READ transaction backs every query
+	// this call makes (the entries list itself, attachRelations,
+	// filterUndeliverableTargets, expandIncludes). Without it, each
+	// query ran against the pool independently, each picking up
+	// whatever had committed by the time *it* ran — so a response could
+	// combine an entries row from before a concurrent publish with
+	// relation or included data from after it (or vice versa), a
+	// snapshot that was never actually true at any single instant. A
+	// fixed snapshot for the whole read closes that gap.
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("begin read tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx, `
 		SELECT id, project_id, content_type_id, document_id, locale, status, data, version, created_at, updated_at
 		FROM entries
 		WHERE project_id = $1 AND content_type_id = $2 AND status = $3 AND locale = $4
@@ -371,16 +386,19 @@ func (s *Service) List(ctx context.Context, projectID uuid.UUID, apiID, status, 
 	}
 	rows.Close()
 
-	if err := s.attachRelations(ctx, projectID, ct.Schema, out); err != nil {
+	if err := s.attachRelations(ctx, tx, projectID, ct.Schema, out); err != nil {
 		return nil, err
 	}
 	if redactPrivateFields {
-		if err := s.filterUndeliverableTargets(ctx, projectID, ct.Schema, locale, out); err != nil {
+		if err := s.filterUndeliverableTargets(ctx, tx, projectID, ct.Schema, locale, out); err != nil {
 			return nil, err
 		}
 	}
-	if err := s.expandIncludes(ctx, projectID, ct.Schema, status, locale, out, include); err != nil {
+	if err := s.expandIncludes(ctx, tx, projectID, ct.Schema, status, locale, out, include); err != nil {
 		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit read tx: %w", err)
 	}
 	if redactPrivateFields {
 		for i := range out {
@@ -398,9 +416,15 @@ func (s *Service) Get(ctx context.Context, projectID uuid.UUID, apiID string, do
 	if locale == "" {
 		locale = "en"
 	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return Entry{}, fmt.Errorf("begin read tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	var e Entry
 	var dataBytes []byte
-	err = s.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT id, project_id, content_type_id, document_id, locale, status, data, version, created_at, updated_at
 		FROM entries
 		WHERE project_id = $1 AND content_type_id = $2 AND document_id = $3 AND status = $4 AND locale = $5`,
@@ -417,16 +441,19 @@ func (s *Service) Get(ctx context.Context, projectID uuid.UUID, apiID string, do
 	}
 
 	entries := []Entry{e}
-	if err := s.attachRelations(ctx, projectID, ct.Schema, entries); err != nil {
+	if err := s.attachRelations(ctx, tx, projectID, ct.Schema, entries); err != nil {
 		return Entry{}, err
 	}
 	if redactPrivateFields {
-		if err := s.filterUndeliverableTargets(ctx, projectID, ct.Schema, locale, entries); err != nil {
+		if err := s.filterUndeliverableTargets(ctx, tx, projectID, ct.Schema, locale, entries); err != nil {
 			return Entry{}, err
 		}
 	}
-	if err := s.expandIncludes(ctx, projectID, ct.Schema, status, locale, entries, include); err != nil {
+	if err := s.expandIncludes(ctx, tx, projectID, ct.Schema, status, locale, entries, include); err != nil {
 		return Entry{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Entry{}, fmt.Errorf("commit read tx: %w", err)
 	}
 	if redactPrivateFields {
 		redactPrivate(ct.Schema, entries[0].Data)

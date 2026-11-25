@@ -50,9 +50,17 @@ yet — this is the hand-written source of truth until that lands.
   is already claimed by another document's published row through the
   same field.
 - `POST .../{collection}/{documentID}/unpublish`.
+- `DELETE .../{collection}/{documentID}` — permanently deletes the
+  document (every locale and draft/published variant of it). Editor
+  role or above. Applies each referencing relation field's `onDelete`
+  policy (see "Schema field types" below): 409 `ErrDocumentReferenced`
+  if any field referencing this document is `restrict` (the default)
+  and still has a live reference; otherwise succeeds (204), clearing
+  (`set_null`) or also deleting (`cascade`) whatever referenced it.
 
 `POST`/`PATCH` on content also return 409 `ErrRelationConflict` for the
-same `one_to_one` reason.
+same `one_to_one`/`one_to_many` reverse-cardinality reason (see
+`docs/adr/0004-field-id-backfill-cardinality-deletion-policy.md`).
 
 ## Delivery API (published only)
 
@@ -114,5 +122,16 @@ the published variant shows until that draft is published again.
 `relation: {targetContentType, relationType}`, relationType one of
 `one_to_one|one_to_many|many_to_one|many_to_many`; the target must be a
 content type in the same project — self-reference, i.e. the content
-type referencing itself, is allowed). See PROGRESS.md for the full list
-of field types from the spec not yet implemented.
+type referencing itself, is allowed). A relation field also accepts an
+optional `onDelete` (`restrict` — the default if omitted, `set_null`,
+or `cascade`), governing what `DELETE
+.../content/{collection}/{documentID}` does to documents still
+referencing a document being deleted through that field. See
+PROGRESS.md for the full list of field types from the spec not yet
+implemented.
+
+A field's `id` is assigned once, the first time it's created, and
+never changes; a client may resubmit a field's own previously-assigned
+`id` (e.g. when re-saving a content type's schema), but two different
+fields can never share one — `content-types` creation rejects that with
+a 400.

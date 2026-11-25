@@ -1,9 +1,15 @@
 package schema
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/google/uuid"
+)
 
 func ptrInt(v int) *int           { return &v }
 func ptrFloat(v float64) *float64 { return &v }
+
+var fixedFieldID = uuid.New()
 
 func TestDefinitionValidate(t *testing.T) {
 	cases := []struct {
@@ -43,6 +49,42 @@ func TestDefinitionValidate(t *testing.T) {
 		{
 			name: "enumeration with values",
 			def:  Definition{Fields: []Field{{Name: "state", Type: FieldEnumeration, Enum: []string{"a", "b"}}}},
+		},
+		{
+			// Client-supplied field ids are allowed (re-submitting a
+			// previously assigned one), but two different fields can
+			// never share one — stored relations are keyed by field id,
+			// so a collision would make lookups ambiguous between them.
+			name: "duplicate client-supplied field id",
+			def: Definition{Fields: []Field{
+				{ID: fixedFieldID, Name: "a", Type: FieldShortText},
+				{ID: fixedFieldID, Name: "b", Type: FieldShortText},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "distinct field ids are fine",
+			def: Definition{Fields: []Field{
+				{ID: fixedFieldID, Name: "a", Type: FieldShortText},
+				{ID: uuid.New(), Name: "b", Type: FieldShortText},
+			}},
+		},
+		{
+			name: "unknown onDelete policy",
+			def: Definition{Fields: []Field{
+				{Name: "author", Type: FieldRelation, Relation: &RelationConfig{
+					TargetContentType: "author", RelationType: RelationOneToOne, OnDelete: "explode",
+				}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "valid onDelete policy",
+			def: Definition{Fields: []Field{
+				{Name: "author", Type: FieldRelation, Relation: &RelationConfig{
+					TargetContentType: "author", RelationType: RelationOneToOne, OnDelete: DeleteCascade,
+				}},
+			}},
 		},
 	}
 

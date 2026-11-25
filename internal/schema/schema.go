@@ -60,6 +60,28 @@ var validRelationTypes = map[RelationType]bool{
 	RelationManyToOne: true, RelationManyToMany: true,
 }
 
+// DeletePolicy governs what happens to a relation field's value when
+// its target document is deleted (internal/content.Service.DeleteDocument).
+type DeletePolicy string
+
+const (
+	// DeleteRestrict rejects deleting a document that is still
+	// referenced through this field — the safest default, and what an
+	// unset OnDelete means.
+	DeleteRestrict DeletePolicy = "restrict"
+	// DeleteSetNull lets the deletion proceed and clears the relation
+	// (the referencing document's value for this field becomes
+	// null/empty; the referencing document itself is untouched).
+	DeleteSetNull DeletePolicy = "set_null"
+	// DeleteCascade lets the deletion proceed and also deletes every
+	// document that references the target through this field.
+	DeleteCascade DeletePolicy = "cascade"
+)
+
+var validDeletePolicies = map[DeletePolicy]bool{
+	DeleteRestrict: true, DeleteSetNull: true, DeleteCascade: true,
+}
+
 // RelationConfig describes what a "relation" field points at. The
 // target is always a content type API id within the *same* project —
 // cross-project references are rejected (internal/content enforces
@@ -67,6 +89,17 @@ var validRelationTypes = map[RelationType]bool{
 type RelationConfig struct {
 	TargetContentType string       `json:"targetContentType"`
 	RelationType      RelationType `json:"relationType"`
+	// OnDelete governs what happens to this field's relation when its
+	// target document is deleted. Empty means DeleteRestrict.
+	OnDelete DeletePolicy `json:"onDelete,omitempty"`
+}
+
+// DeletePolicyOrDefault returns OnDelete, or DeleteRestrict if unset.
+func (rc RelationConfig) DeletePolicyOrDefault() DeletePolicy {
+	if rc.OnDelete == "" {
+		return DeleteRestrict
+	}
+	return rc.OnDelete
 }
 
 // IsToMany reports whether a relation field's value is a list (true for
@@ -122,6 +155,7 @@ type Definition struct {
 // It does not look at any content.
 func (d Definition) Validate() error {
 	seen := map[string]bool{}
+	seenIDs := map[uuid.UUID]bool{}
 	for _, f := range d.Fields {
 		if !apiNamePattern.MatchString(f.Name) {
 			return fmt.Errorf("field %q: name must start with a letter and contain only letters, digits, underscores", f.Name)
@@ -133,6 +167,18 @@ func (d Definition) Validate() error {
 			return fmt.Errorf("field %q: duplicate field name", f.Name)
 		}
 		seen[f.Name] = true
+
+		// A client may supply a field id explicitly (e.g. re-submitting
+		// a previously assigned one); what it may never do is supply
+		// the same id for two different fields — that would make
+		// stored-relation lookups (keyed by field id) ambiguous between
+		// them. A zero id is fine: Registry.Create assigns a fresh one.
+		if f.ID != uuid.Nil {
+			if seenIDs[f.ID] {
+				return fmt.Errorf("field %q: duplicate field id %s", f.Name, f.ID)
+			}
+			seenIDs[f.ID] = true
+		}
 
 		if !validFieldTypes[f.Type] {
 			return fmt.Errorf("field %q: unknown field type %q", f.Name, f.Type)
@@ -146,6 +192,9 @@ func (d Definition) Validate() error {
 			}
 			if !validRelationTypes[f.Relation.RelationType] {
 				return fmt.Errorf("field %q: unknown relationType %q", f.Name, f.Relation.RelationType)
+			}
+			if f.Relation.OnDelete != "" && !validDeletePolicies[f.Relation.OnDelete] {
+				return fmt.Errorf("field %q: unknown onDelete policy %q", f.Name, f.Relation.OnDelete)
 			}
 		}
 	}

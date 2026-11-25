@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -501,6 +502,300 @@ func TestDocumentDeletionCascadesToEntriesAndRelations(t *testing.T) {
 	}
 	if got := draft["data"].(map[string]any)["author"]; got != nil {
 		t.Fatalf("expected the relation to the deleted document to be gone (cascaded), got %v", got)
+	}
+}
+
+// TestOneToOneLocaleVariantsOfSameDocumentDontConflict guards against a
+// bug the locale-aware reverse-uniqueness index (migrations/0005) fixed:
+// the original index (migrations/0004) was keyed by (field_id,
+// to_document_id) alone, so two locale variants of the SAME document
+// both publishing a one_to_one relation to the same target looked
+// identical to two DIFFERENT documents claiming it — and was wrongly
+// rejected. Locale variants of one document aren't a second claim.
+func TestOneToOneLocaleVariantsOfSameDocumentDontConflict(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupBlogWithAuthorAndComment(t, env)
+
+	_, author := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/", map[string]any{
+		"data": map[string]any{"name": "Ada"},
+	})
+	authorID := author["documentId"].(string)
+	owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorID+"/publish", nil)
+
+	resp, post := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Spotlight (en)", "featuredAuthor": authorID},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create post: %d %v", resp.StatusCode, post)
+	}
+	postID := post["documentId"].(string)
+	postCTID := post["contentTypeId"].(string)
+
+	resp, published := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+postID+"/publish", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish en post: %d %v", resp.StatusCode, published)
+	}
+
+	// Simulate an "fr" locale variant of the SAME document (no API for
+	// this yet — see PROGRESS.md) publishing the same one_to_one target.
+	// This must NOT collide with the "en" row above: same document,
+	// different locale.
+	frData, err := json.Marshal(map[string]any{"title": "Spotlight (fr)"})
+	if err != nil {
+		t.Fatalf("marshal fr data: %v", err)
+	}
+	var frEntryID uuid.UUID
+	err = env.pool.QueryRow(context.Background(), `
+		INSERT INTO entries (project_id, content_type_id, document_id, locale, status, data)
+		VALUES ($1, $2, $3, 'fr', 'published', $4)
+		RETURNING id`,
+		mustParseUUID(t, projectID), mustParseUUID(t, postCTID), mustParseUUID(t, postID), frData,
+	).Scan(&frEntryID)
+	if err != nil {
+		t.Fatalf("insert fr post row: %v", err)
+	}
+	var fieldID uuid.UUID
+	err = env.pool.QueryRow(context.Background(), `
+		SELECT field_id FROM entry_relations WHERE from_entry_id = (
+			SELECT id FROM entries WHERE document_id = $1 AND locale = 'en' AND status = 'published'
+		) LIMIT 1`, mustParseUUID(t, postID),
+	).Scan(&fieldID)
+	if err != nil {
+		t.Fatalf("find featuredAuthor field id: %v", err)
+	}
+	_, err = env.pool.Exec(context.Background(), `
+		INSERT INTO entry_relations
+			(project_id, from_entry_id, from_field, field_id, from_document_id, to_document_id, locale, status, relation_type, position)
+		VALUES ($1, $2, 'featuredAuthor', $3, $4, $5, 'fr', 'published', 'one_to_one', 0)`,
+		mustParseUUID(t, projectID), frEntryID, fieldID, mustParseUUID(t, postID), mustParseUUID(t, authorID))
+	if err != nil {
+		t.Fatalf("expected the fr locale variant's one_to_one relation to the same target to be allowed (same document, different locale), got: %v", err)
+	}
+}
+
+// TestOneToManyReverseCardinality mirrors the one_to_one test but for
+// one_to_many: a target may belong to at most one parent through a
+// given field (the "one" side), even though many_to_one/many_to_many
+// correctly allow unlimited sharing.
+func TestOneToManyReverseCardinality(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupBlogWithAuthorAndComment(t, env)
+
+	_, child := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Child"},
+	})
+	childID := child["documentId"].(string)
+
+	_, parentA := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Parent A", "related": []string{childID}},
+	})
+	parentAID := parentA["documentId"].(string)
+	_, parentB := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Parent B", "related": []string{childID}},
+	})
+	parentBID := parentB["documentId"].(string)
+
+	resp, publishedA := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+parentAID+"/publish", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish parent A: %d %v", resp.StatusCode, publishedA)
+	}
+
+	resp, body := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+parentBID+"/publish", nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 publishing a second one_to_many parent for an already-claimed child, got %d %v", resp.StatusCode, body)
+	}
+}
+
+// setupDeletePolicies creates a "target" content type and three
+// pointer content types, each referencing it with a different
+// relation.onDelete policy, so DeleteDocument's three branches can be
+// tested independently (one target document per policy, so one
+// policy's outcome never interferes with another's).
+func setupDeletePolicies(t *testing.T, env *testEnv) (owner *client, projectID string) {
+	t.Helper()
+	owner = env.bootstrapOwner(t, "owner@example.com", "owner-password-1")
+	_, project := owner.do(http.MethodPost, "/api/v1/manage/projects/", map[string]any{"name": "DelPolicy", "slug": "delpolicy"})
+	projectID = project["id"].(string)
+
+	resp, body := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content-types/", map[string]any{
+		"apiId": "target", "displayName": "Target", "kind": "collection",
+		"schema": map[string]any{"fields": []map[string]any{{"name": "name", "type": "short_text", "required": true}}},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create target content type: %d %v", resp.StatusCode, body)
+	}
+
+	policies := map[string]string{
+		"pointerRestrict": "", // unset -> defaults to restrict
+		"pointerSetNull":  "set_null",
+		"pointerCascade":  "cascade",
+	}
+	for apiID, onDelete := range policies {
+		relation := map[string]any{"targetContentType": "target", "relationType": "many_to_one"}
+		if onDelete != "" {
+			relation["onDelete"] = onDelete
+		}
+		resp, body := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content-types/", map[string]any{
+			"apiId": apiID, "displayName": apiID, "kind": "collection",
+			"schema": map[string]any{"fields": []map[string]any{
+				{"name": "name", "type": "short_text", "required": true},
+				{"name": "ref", "type": "relation", "relation": relation},
+			}},
+		})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create %s content type: %d %v", apiID, resp.StatusCode, body)
+		}
+	}
+	return owner, projectID
+}
+
+func TestDeleteDocumentRestrictPolicyBlocksDeletion(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupDeletePolicies(t, env)
+
+	_, target := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/target/", map[string]any{"data": map[string]any{"name": "T1"}})
+	targetID := target["documentId"].(string)
+	resp, pointer := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/pointerRestrict/", map[string]any{
+		"data": map[string]any{"name": "P1", "ref": targetID},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create pointer: %d %v", resp.StatusCode, pointer)
+	}
+
+	resp, body := owner.do(http.MethodDelete, "/api/v1/manage/projects/"+projectID+"/content/target/"+targetID, nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 deleting a restrict-referenced document, got %d %v", resp.StatusCode, body)
+	}
+
+	resp, _ = owner.do(http.MethodGet, "/api/v1/manage/projects/"+projectID+"/content/target/"+targetID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected target to still exist after a blocked delete, got %d", resp.StatusCode)
+	}
+}
+
+func TestDeleteDocumentSetNullPolicyClearsReference(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupDeletePolicies(t, env)
+
+	_, target := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/target/", map[string]any{"data": map[string]any{"name": "T2"}})
+	targetID := target["documentId"].(string)
+	_, pointer := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/pointerSetNull/", map[string]any{
+		"data": map[string]any{"name": "P2", "ref": targetID},
+	})
+	pointerID := pointer["documentId"].(string)
+
+	resp, body := owner.do(http.MethodDelete, "/api/v1/manage/projects/"+projectID+"/content/target/"+targetID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 deleting a set_null-referenced document, got %d %v", resp.StatusCode, body)
+	}
+
+	resp, _ = owner.do(http.MethodGet, "/api/v1/manage/projects/"+projectID+"/content/target/"+targetID, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected target to be gone, got %d", resp.StatusCode)
+	}
+
+	resp, got := owner.do(http.MethodGet, "/api/v1/manage/projects/"+projectID+"/content/pointerSetNull/"+pointerID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get pointer: %d %v", resp.StatusCode, got)
+	}
+	if ref := got["data"].(map[string]any)["ref"]; ref != nil {
+		t.Fatalf("expected set_null to clear the pointer's relation, got %v", ref)
+	}
+}
+
+func TestDeleteDocumentCascadePolicyDeletesReferencingDocument(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupDeletePolicies(t, env)
+
+	_, target := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/target/", map[string]any{"data": map[string]any{"name": "T3"}})
+	targetID := target["documentId"].(string)
+	_, pointer := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/pointerCascade/", map[string]any{
+		"data": map[string]any{"name": "P3", "ref": targetID},
+	})
+	pointerID := pointer["documentId"].(string)
+
+	resp, body := owner.do(http.MethodDelete, "/api/v1/manage/projects/"+projectID+"/content/target/"+targetID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 deleting a cascade-referenced document, got %d %v", resp.StatusCode, body)
+	}
+
+	resp, _ = owner.do(http.MethodGet, "/api/v1/manage/projects/"+projectID+"/content/pointerCascade/"+pointerID, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected the cascade policy to also delete the referencing document, got %d", resp.StatusCode)
+	}
+}
+
+// TestConcurrentPublishBlocksUpdateUntilCommit is a deterministic
+// regression test for Publish's FOR UPDATE lock (internal/content.
+// Service.Publish): it holds that exact lock itself (via a raw SQL
+// transaction, simulating Publish mid-flight) and asserts a concurrent
+// Update blocks the whole time the lock is held, only completing after
+// it's released — never relying on sleep-and-hope timing to prove it.
+func TestConcurrentPublishBlocksUpdateUntilCommit(t *testing.T) {
+	env := newTestEnv(t)
+	owner := env.bootstrapOwner(t, "owner@example.com", "owner-password-1")
+
+	_, project := owner.do(http.MethodPost, "/api/v1/manage/projects/", map[string]any{"name": "Blog", "slug": "blog"})
+	projectID := project["id"].(string)
+	owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content-types/", map[string]any{
+		"apiId": "post", "displayName": "Post", "kind": "collection",
+		"schema": map[string]any{"fields": []map[string]any{{"name": "title", "type": "short_text", "required": true}}},
+	})
+	_, entry := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "v1"},
+	})
+	documentID := entry["documentId"].(string)
+	version := int(entry["version"].(float64))
+
+	ctx := context.Background()
+	tx, err := env.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin lock tx: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	lockHeld := make(chan struct{})
+	release := make(chan struct{})
+	lockErrs := make(chan error, 1)
+	go func() {
+		_, err := tx.Exec(ctx, `SELECT id FROM entries WHERE document_id = $1 AND status = 'draft' FOR UPDATE`, mustParseUUID(t, documentID))
+		close(lockHeld)
+		<-release
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+		lockErrs <- err
+	}()
+	<-lockHeld
+
+	updateDone := make(chan struct{})
+	go func() {
+		resp, body := owner.do(http.MethodPatch, "/api/v1/manage/projects/"+projectID+"/content/post/"+documentID, map[string]any{
+			"expectedVersion": version,
+			"data":            map[string]any{"title": "v2"},
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("concurrent update: %d %v", resp.StatusCode, body)
+		}
+		close(updateDone)
+	}()
+
+	select {
+	case <-updateDone:
+		t.Fatalf("the concurrent update completed while the row lock was still held — FOR UPDATE did not serialize the writers")
+	case <-time.After(300 * time.Millisecond):
+		// Expected: Update is blocked on the row lock.
+	}
+
+	close(release)
+	if err := <-lockErrs; err != nil {
+		t.Fatalf("lock holder transaction: %v", err)
+	}
+
+	select {
+	case <-updateDone:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("update never completed after the lock was released")
 	}
 }
 

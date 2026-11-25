@@ -157,6 +157,28 @@ func (h *Handler) Unpublish(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
+	projectID, _, err := params(r)
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid project id")
+		return
+	}
+	documentID, err := uuid.Parse(chi.URLParam(r, "documentID"))
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "invalid document id")
+		return
+	}
+	if err := h.svc.DeleteDocument(r.Context(), projectID, documentID); err != nil {
+		if errors.Is(err, ErrDocumentReferenced) {
+			httpx.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handler) ListDrafts(w http.ResponseWriter, r *http.Request) {
 	h.list(w, r, StatusDraft, false)
 }

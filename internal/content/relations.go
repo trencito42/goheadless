@@ -154,7 +154,7 @@ func uniqueUUIDs(ids []uuid.UUID) []uuid.UUID {
 // stable id (not its name — survives a future rename), plus
 // fromDocumentID/status/relationType, denormalized so reads and the
 // one_to_one uniqueness constraint don't need a join back to entries.
-func setRelations(ctx context.Context, tx execer, projectID, fromEntryID, fromDocumentID uuid.UUID, status string, relFields []schema.Field, relationValues map[string][]uuid.UUID) error {
+func setRelations(ctx context.Context, tx execer, projectID, fromEntryID, fromDocumentID uuid.UUID, locale, status string, relFields []schema.Field, relationValues map[string][]uuid.UUID) error {
 	fieldsByName := make(map[string]schema.Field, len(relFields))
 	for _, f := range relFields {
 		fieldsByName[f.Name] = f
@@ -172,11 +172,11 @@ func setRelations(ctx context.Context, tx execer, projectID, fromEntryID, fromDo
 		for i, targetID := range ids {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO entry_relations
-					(project_id, from_entry_id, from_field, field_id, from_document_id, to_document_id, status, relation_type, position)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-				projectID, fromEntryID, f.Name, f.ID, fromDocumentID, targetID, status, string(f.Relation.RelationType), i); err != nil {
+					(project_id, from_entry_id, from_field, field_id, from_document_id, to_document_id, locale, status, relation_type, position)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				projectID, fromEntryID, f.Name, f.ID, fromDocumentID, targetID, locale, status, string(f.Relation.RelationType), i); err != nil {
 				if isUniqueViolation(err) {
-					return fmt.Errorf("field %q: %w: this document is already linked by another document's published %s relation", f.Name, ErrRelationConflict, f.Name)
+					return fmt.Errorf("field %q: %w: this document is already linked by another document's published %s relation in this locale", f.Name, ErrRelationConflict, f.Name)
 				}
 				return fmt.Errorf("insert relation for field %q: %w", f.Name, err)
 			}
@@ -229,7 +229,7 @@ func loadRelationIDs(ctx context.Context, tx execer, fromEntryID uuid.UUID, relF
 // toStatus (typically the published row being promoted), including
 // fields with no value so a relation cleared on the draft is also
 // cleared on the published copy.
-func copyRelations(ctx context.Context, tx execer, projectID, fromEntryID, toEntryID, toDocumentID uuid.UUID, toStatus string, relFields []schema.Field) error {
+func copyRelations(ctx context.Context, tx execer, projectID, fromEntryID, toEntryID, toDocumentID uuid.UUID, locale, toStatus string, relFields []schema.Field) error {
 	snapshot, err := loadRelationIDs(ctx, tx, fromEntryID, relFields)
 	if err != nil {
 		return fmt.Errorf("load source relations: %w", err)
@@ -239,7 +239,7 @@ func copyRelations(ctx context.Context, tx execer, projectID, fromEntryID, toEnt
 			snapshot[f.Name] = nil // ensure a field cleared on the source is also cleared on the copy.
 		}
 	}
-	return setRelations(ctx, tx, projectID, toEntryID, toDocumentID, toStatus, relFields, snapshot)
+	return setRelations(ctx, tx, projectID, toEntryID, toDocumentID, locale, toStatus, relFields, snapshot)
 }
 
 // shapeRelationValue converts a stored/parsed id list into the JSON
@@ -270,7 +270,7 @@ func shapeRelationValue(f schema.Field, ids []uuid.UUID) any {
 // relation fields. Lookup is keyed by each entry's own row id, which is
 // what keeps a draft's relations from ever being attached to its
 // published sibling or vice versa.
-func (s *Service) attachRelations(ctx context.Context, projectID uuid.UUID, def schema.Definition, entries []Entry) error {
+func (s *Service) attachRelations(ctx context.Context, db execer, projectID uuid.UUID, def schema.Definition, entries []Entry) error {
 	relFields := def.RelationFields()
 	if len(relFields) == 0 || len(entries) == 0 {
 		return nil
@@ -285,7 +285,7 @@ func (s *Service) attachRelations(ctx context.Context, projectID uuid.UUID, def 
 		entryIDs[i] = e.ID
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := db.Query(ctx, `
 		SELECT from_entry_id, field_id, to_document_id
 		FROM entry_relations
 		WHERE project_id = $1 AND from_entry_id = ANY($2)
@@ -334,7 +334,7 @@ func (s *Service) attachRelations(ctx context.Context, projectID uuid.UUID, def 
 // published in this locale) after the source's own last publish —
 // delivering that id as if it resolved would be delivering an
 // unpublished document's identity to a public consumer.
-func (s *Service) filterUndeliverableTargets(ctx context.Context, projectID uuid.UUID, def schema.Definition, locale string, entries []Entry) error {
+func (s *Service) filterUndeliverableTargets(ctx context.Context, db execer, projectID uuid.UUID, def schema.Definition, locale string, entries []Entry) error {
 	relFields := def.RelationFields()
 	if len(relFields) == 0 || len(entries) == 0 {
 		return nil
@@ -354,7 +354,7 @@ func (s *Service) filterUndeliverableTargets(ctx context.Context, projectID uuid
 		ids = append(ids, id)
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := db.Query(ctx, `
 		SELECT document_id FROM entries
 		WHERE project_id = $1 AND status = $2 AND locale = $3 AND document_id = ANY($4)`,
 		projectID, StatusPublished, locale, ids)
@@ -420,7 +420,7 @@ func filterRelationValue(f schema.Field, value any, allowed map[uuid.UUID]bool) 
 // status) identity — without this, a target with published rows in
 // several locales could have an arbitrary one of them picked, since
 // document_id alone doesn't disambiguate locale.
-func (s *Service) expandIncludes(ctx context.Context, projectID uuid.UUID, def schema.Definition, status, locale string, entries []Entry, include []string) error {
+func (s *Service) expandIncludes(ctx context.Context, db execer, projectID uuid.UUID, def schema.Definition, status, locale string, entries []Entry, include []string) error {
 	if len(include) == 0 || len(entries) == 0 {
 		return nil
 	}
@@ -450,7 +450,7 @@ func (s *Service) expandIncludes(ctx context.Context, projectID uuid.UUID, def s
 			ids = append(ids, id)
 		}
 
-		rows, err := s.pool.Query(ctx, `
+		rows, err := db.Query(ctx, `
 			SELECT document_id, data FROM entries
 			WHERE project_id = $1 AND content_type_id = $2 AND document_id = ANY($3) AND status = $4 AND locale = $5`,
 			projectID, targetCT.ID, ids, status, locale)
