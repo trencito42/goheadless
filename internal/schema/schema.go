@@ -85,6 +85,13 @@ var reservedFieldNames = map[string]bool{
 var apiNamePattern = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9_]*$`)
 
 type Field struct {
+	// ID is the field's stable identity: assigned once when the field
+	// is first created (Registry.Create fills in a zero ID) and never
+	// changed afterward, even if Name is later renamed (once schema
+	// migrations support that). internal/content keys stored relations
+	// by this, not by Name, so a rename can't silently orphan them —
+	// see docs/adr/0003-document-identity.md.
+	ID          uuid.UUID `json:"id"`
 	Name        string    `json:"name"`
 	Type        FieldType `json:"type"`
 	Required    bool      `json:"required"`

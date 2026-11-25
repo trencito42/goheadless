@@ -18,28 +18,46 @@ a `schema_migrations` table).
   unique — this is what makes publish an atomic upsert rather than a
   separate table swap. GIN index on `data` for future filtering.
 
-## Relations (migrations/0003_relations.sql)
+## Documents and relations (migrations/0003, 0004)
 
+- `documents` — one row per `document_id`: `id` (the document id
+  itself), `project_id`, `content_type_id`. Added in migrations/0004
+  after the original relations work (migrations/0003) shipped with no
+  such table — see `docs/adr/0003-document-identity.md` for why.
+  `entries.document_id` and `entry_relations.to_document_id` are both
+  real foreign keys to it, `ON DELETE CASCADE`.
+- `entries` — same as above, plus: `document_id` now FKs to
+  `documents(id)` `ON DELETE CASCADE` (previously just a bare UUID).
 - `entry_relations` — one row per (source entry row, field, target
   document). `from_entry_id` FKs to `entries(id)` (the specific draft or
   published *row*, not the document) `ON DELETE CASCADE`, so deleting an
   entries row (e.g. `Unpublish`) automatically cleans up its relations.
-  `to_document_id` has no FK (there is no single "documents" table to
-  point at — see `docs/adr/0002-relations.md`); existence, project, and
-  content-type matching are enforced in `internal/content` at write
-  time instead.
+  `to_document_id` FKs to `documents(id)` `ON DELETE CASCADE`. Also
+  carries `field_id` (the relation field's stable id, not its display
+  name — survives a future rename), `from_document_id` (denormalized
+  from the owning entries row), and `status`/`relation_type`
+  (denormalized from the entries row / schema at write time).
 - Keying by row id rather than document id is what makes draft and
   published relations independent snapshots: editing a draft's
   relations never changes what's published until that draft is
   published again (`internal/content.Service.Publish` copies the
   draft's current relation rows onto the published row as part of the
-  same transaction that promotes its data).
+  same transaction that promotes its data, after taking a `FOR UPDATE`
+  lock on the draft row so a concurrent `Update` can't produce a
+  snapshot that mixes old data with new relations or vice versa).
 - `UNIQUE (from_entry_id, from_field, to_document_id)` prevents the same
-  target being linked twice from the same field. There is **no**
-  reverse-uniqueness constraint for `one_to_one`/`many_to_one` (nothing
-  stops two different source entries from both pointing at the same
-  target) — tracked as a known gap in PROGRESS.md, not silently assumed
-  solved.
+  target being linked twice from the same field.
+- `one_to_one`'s reverse-uniqueness ("at most one document may claim
+  this target through this field") is a real, race-free constraint:
+  `CREATE UNIQUE INDEX entry_relations_one_to_one_published_target_idx
+  ON entry_relations (field_id, to_document_id) WHERE status =
+  'published' AND relation_type = 'one_to_one'`. Scoped to `published`
+  specifically — a document's own draft and published rows legitimately
+  share a target (that's what publishing is); the conflict only becomes
+  real once a *second* document's draft actually publishes. `many_to_one`
+  and `many_to_many` correctly get no such constraint — many sources are
+  supposed to share a target. Full rationale in
+  `docs/adr/0003-document-identity.md`.
 
 ## What isn't here yet
 

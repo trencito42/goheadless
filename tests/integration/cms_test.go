@@ -49,6 +49,7 @@ func testDatabaseURL() (url string, explicit bool) {
 type testEnv struct {
 	srv     *httptest.Server
 	authSvc *auth.Service
+	pool    *pgxpool.Pool
 }
 
 // newTestEnv spins up the full router against a real database, wiped
@@ -99,7 +100,7 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
-	return &testEnv{srv: srv, authSvc: authSvc}
+	return &testEnv{srv: srv, authSvc: authSvc, pool: pool}
 }
 
 // bootstrapOwner creates the owner account directly through the service

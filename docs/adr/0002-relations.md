@@ -42,9 +42,16 @@ table whose primary key it could reference (a document is just a value
 shared by its draft/published entries rows, per ADR 0001). Existence of
 the target, and that it belongs to the same project and the field's
 configured target content type, are checked in application code
-(`internal/content.Service.validateRelationTargets`) before the write,
-inside the same transaction as the entries row and relation rows it
-belongs to.
+(`internal/content.Service.validateRelationTargets`) before the write.
+
+> **Amended by ADR 0003**: the paragraph above was accurate when
+> written but is no longer the current design. ADR 0003 adds a real
+> `documents` table, giving `to_document_id` an actual foreign key, and
+> moves `validateRelationTargets` to run inside the same transaction as
+> the write it validates (it originally ran against the pool directly,
+> outside that transaction — a gap an independent audit caught). Left
+> here rather than edited away, same as the cardinality correction
+> below.
 
 Cross-project references are rejected structurally, not just by a
 check that could be bypassed: the target content type is always
@@ -71,16 +78,15 @@ look up another project's content type or rows.
   read is a draft or delivery read — `internal/content` has no notion
   of the caller's permission level at that depth, so an expanded embed
   is always the redacted, public-safe projection.
-- **Known gap**: `one_to_one` and `many_to_one` relations are
-  constrained to a single target *on the source side* (enforced by
-  value shape — a bare id, not a list), but there is no
-  reverse-uniqueness constraint stopping two different source entries
-  from pointing at the same target through a `one_to_one` field. A true
-  1:1 invariant would need either a unique index scoped by
-  (content-type, field) — which `entry_relations` doesn't currently
-  store — or an application-level check inside the write transaction.
-  Not implemented in this pass; tracked honestly in PROGRESS.md rather
-  than assumed solved.
+- **Correction (see ADR 0003)**: this ADR originally claimed here that
+  neither `one_to_one` nor `many_to_one` had a reverse-uniqueness
+  constraint, as if that were one gap. That conflated two different
+  things. `many_to_one` is *supposed* to let many source documents
+  reference the same target — it never needed reverse uniqueness, and
+  was never missing anything. `one_to_one` genuinely did need it; ADR
+  0003 adds a real, race-free database constraint for it (a documents
+  table makes that possible). Left here so the mistake is visible
+  rather than quietly edited away.
 - Components and dynamic zones (not yet implemented) will likely reuse
   this same "keyed by entry row id" pattern for their own nested
   relations, once they exist.

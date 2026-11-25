@@ -1,6 +1,8 @@
 # PROGRESS
 
-Last updated: 2026-11-25 (relations + ownership fix + test-suite hardening).
+Last updated: 2026-11-25 (relation integrity hardening: documents table,
+transaction-scoped validation, correct cardinality, locale-aware
+expansion, unpublished-target filtering, concurrency-safe publish).
 
 This tracks exactly what's real. "VERIFIED" means it was actually run and
 observed to work in this environment — not inferred from the code
@@ -43,8 +45,14 @@ compiling.
   test-skip-vs-fail fix above is for) and `frontend` (`pnpm install
   --frozen-lockfile`, design-system build, `tsc` typecheck, `vite
   build`). Next person to push should confirm it actually goes green on
-  GitHub and fix anything this local-only review couldn't catch.
-- No ADRs written yet (docs/adr/ is empty). NOT_STARTED.
+  GitHub and fix anything this local-only review couldn't catch. Now
+  also runs `go test -race ./...` on this Linux job specifically,
+  since the Windows machine this project is otherwise developed on has
+  no C compiler for cgo (see Tests below) — Linux runners ship gcc, so
+  this is the one place `-race` actually runs, not a second skip.
+- `docs/adr/` — stale note removed: three ADRs exist (0001 hybrid
+  storage, 0002 relations, 0003 document identity/relation integrity),
+  not zero.
 
 ## Phase 1 — First vertical slice: IMPLEMENTED and VERIFIED end-to-end
 
@@ -121,52 +129,105 @@ anyone's, unchanged. VERIFIED by
 different author-role users plus an editor-promoted one, against real
 Postgres).
 
-## Relations — IMPLEMENTED and VERIFIED (migrations/0003_relations.sql)
+## Relations — IMPLEMENTED and VERIFIED (migrations/0003, 0004)
 
 A `relation` field type (`one_to_one`, `one_to_many`, `many_to_one`,
 `many_to_many`), stored in a dedicated `entry_relations` table rather
-than the JSONB `data` column. Full design rationale in
-`docs/adr/0002-relations.md`; API shape in `docs/API.md`.
+than the JSONB `data` column, plus a real `documents` table backing
+both `entries.document_id` and `entry_relations.to_document_id` with
+foreign keys. Full design rationale in `docs/adr/0002-relations.md` and
+`docs/adr/0003-document-identity.md`; API shape in `docs/API.md`.
 
 - Schema: `schema.RelationConfig` (`targetContentType`, `relationType`),
   validated structurally (`Definition.Validate`) and by value shape
   (`validateRelationValue` — a single document-id string for to-one, a
-  list of them for to-many).
+  list of them for to-many). Every field (not just relations) now also
+  carries a stable `schema.Field.ID`, assigned once at creation and
+  never changed — `entry_relations` is keyed by this, not by the
+  field's display name, so a future field rename (schema migrations
+  are still NOT_STARTED) won't orphan stored relations.
 - Registry: creating a content type with a relation field checks the
   target content type exists in the **same project** (or is the type
   being created itself, for self-reference) before accepting it.
+- **Documents are a real identity, not just a shared UUID value**
+  (fixed in an independent audit of the original relations work):
+  `documents` is one row per `document_id`; `entries.document_id` and
+  `entry_relations.to_document_id` are real foreign keys to it, both
+  `ON DELETE CASCADE`. There is still no "delete a document" API, so
+  this cascade isn't reachable through the HTTP API yet, but it's
+  VERIFIED directly against the database by
+  `TestDocumentDeletionCascadesToEntriesAndRelations` (delete a
+  `documents` row → its own entries rows and any relation pointing at
+  it both disappear, with no application code needed).
 - Content service: relation values are split out of the submitted
   `data` before it's stored as JSONB (`splitRelationFields`), validated
   against the real `entries` table — target must exist, belong to the
   same project, and match the configured target content type
-  (`validateRelationTargets`) — and persisted as `entry_relations` rows
-  inside the same transaction as the entries write (`setRelations`).
+  (`validateRelationTargets`) — and persisted as `entry_relations` rows,
+  all **inside the same transaction** as the entries write
+  (`setRelations`). Previously `validateRelationTargets` ran against the
+  pool directly, outside that transaction — an audit finding, now fixed;
+  a real FK backs the check up regardless.
 - **Draft/published are independent snapshots**: `entry_relations` is
   keyed by the specific entries *row* id (`from_entry_id`), not the
   document id. Editing a draft's relations never changes what's
   published until `Publish` explicitly copies the draft's current
   relation rows onto the published row (`copyRelations`), inside the
-  same transaction that promotes its data. `Unpublish` deleting the
-  published row cascades (FK `ON DELETE CASCADE`) to clean up its
-  relation rows automatically.
+  same transaction that promotes its data. That transaction now takes a
+  `FOR UPDATE` lock on the draft row first (another audit finding, now
+  fixed) — without it, a concurrent `Update()` could commit a new
+  data+relation snapshot in the gap between `Publish` reading the
+  draft's data and reading its relations, producing a published
+  snapshot that was never actually true at any single instant.
+  `Unpublish` deleting the published row cascades (FK `ON DELETE
+  CASCADE`) to clean up its relation rows automatically.
 - Reads (`List`/`Get`) batch-load every entry's relations in one query
   (`attachRelations`, keyed by a batch of row ids — never one query per
   entry), returning bare document-id stub(s) by default.
+- **Delivery reads never deliver an unpublished target's id**: a
+  published entry's relation stub is checked against which of its
+  referenced documents actually have a published row *in the requested
+  locale* right now (`filterUndeliverableTargets`) — nulling a to-one
+  stub or dropping entries from a to-many list if the target was
+  unpublished (or never published in that locale) after the source's
+  own last publish. The management/draft API still shows the raw stub,
+  since editors need to see and fix a dangling reference, not have it
+  hidden. VERIFIED by `TestDeliveryFiltersUnpublishedRelationTargets`.
 - `?include=fieldName` expands a relation field into the full related
   entry's data, one query per included field (not per entry, not
   recursive — an included entry's own relations stay as stubs, which is
   what keeps this bounded to one level without needing cycle
-  detection).
+  detection). The target lookup is now scoped to the same locale as the
+  entries being expanded (previously it wasn't — an audit finding: since
+  `document_id` alone doesn't disambiguate locale, a target with
+  published rows in several locales could have had an arbitrary one
+  returned). VERIFIED by `TestLocaleAwareRelationExpansion`.
 - **Private fields never leak through relation expansion or the
   delivery API**: `schema.Field.Private` (existed before but was never
-  actually enforced anywhere — also found in audit) is now stripped
-  from (a) every delivery-API response (`ListPublished`/`GetPublished`)
-  and (b) every relation-expansion embed, unconditionally, regardless
-  of whether the outer read is a draft or published one (expansion has
-  no notion of the caller's permission level, so it always returns the
-  redacted projection). Private fields remain visible on the
+  actually enforced anywhere — also found in an earlier audit) is
+  stripped from (a) every delivery-API response
+  (`ListPublished`/`GetPublished`) and (b) every relation-expansion
+  embed, unconditionally, regardless of whether the outer read is a
+  draft or published one. Private fields remain visible on the
   authenticated management/draft API, since editors need to see and
   edit them.
+- **Cardinality, corrected**: `many_to_one` and `many_to_many` let many
+  source documents reference the same target — that was always correct
+  and is now explicitly regression-tested
+  (`TestManyToOneAllowsMultipleSourcesToSameTarget`), not just assumed.
+  `one_to_one` reverse-uniqueness ("at most one document may claim this
+  target through this field") is now a **real, race-free database
+  constraint** — a partial unique index scoped to `status = 'published'`
+  (so a document's own draft+published rows legitimately sharing a
+  target, which is what publishing *is*, doesn't self-conflict; two
+  different documents' *drafts* may transiently both point at the same
+  target, with the conflict becoming real only once one of them
+  publishes). A violation surfaces as a 409 (`ErrRelationConflict`), not
+  a raw database error. VERIFIED by
+  `TestOneToOneRejectsSecondPublishedReferenceButAllowsConcurrentDrafts`.
+  Full rationale, including why the earlier version of this paragraph
+  was wrong to lump `many_to_one` in with this gap, is in
+  `docs/adr/0003-document-identity.md`.
 - Cross-project relation targets are rejected — not just checked, but
   structurally impossible, since the target content type is always
   resolved through `registry.Get(callerProjectID, ...)`, so there is no
@@ -176,21 +237,25 @@ than the JSONB `data` column. Full design rationale in
   VERIFIED by `TestRelationSelfReferencingAndToMany`.
 
 VERIFIED end-to-end against real Postgres in
-`tests/integration/relations_test.go`: create + fetch with a stub and
-an expanded relation (`TestRelationCreateAndFetch`), cross-project
-rejection, self-reference + to-many, draft/published snapshot
-independence across an update-then-publish sequence
-(`TestRelationDraftAndPublishedAreIndependentSnapshots`), author
-ownership enforcement, and delivery-API private-field redaction.
+`tests/integration/relations_test.go` (15 tests covering everything
+above — create/fetch with a stub and an expanded relation,
+cross-project rejection, self-reference + to-many, draft/published
+snapshot independence, author ownership, private-field redaction,
+many_to_one multi-source, one_to_one conflict + concurrent-drafts
+allowance, unpublished-target filtering, locale-aware expansion, and
+document-deletion cascade).
 
-**Known gap, not solved in this pass**: no reverse-uniqueness for
-`one_to_one`/`many_to_one` — nothing stops two different source entries
-from pointing at the same target through what's modeled as a one-to-one
-field (the DB has no way to express "unique scoped to this specific
-field of this specific content type" with the current table shape).
-Documented in `docs/adr/0002-relations.md` rather than silently assumed
-solved. Also not done: components, dynamic zones (relations are a
-prerequisite for both, now unblocked).
+**Known gap, still not solved**: a genuine *concurrency* regression
+test (two goroutines racing `Update`/`Publish` against the same
+document to prove the `FOR UPDATE` lock actually serializes them, not
+just that the code calls it) was not written in this pass — writing a
+deterministic one needs controlled timing/goroutine orchestration that
+didn't fit this session's scope. The lock's correctness is argued from
+reading the code and from Postgres's documented row-lock semantics, not
+from a race test. Also still not done: components, dynamic zones
+(relations were the prerequisite for both; now unblocked); "delete a
+document" has no API yet, so the cascade FKs above are verified at the
+database level but not reachable through HTTP.
 
 ## Tests — now real, IMPLEMENTED and VERIFIED
 
@@ -208,10 +273,8 @@ prerequisite for both, now unblocked).
   visibility), schema validation rejecting missing/unexpected fields
   through the real HTTP path, owner-only routes rejecting a non-owner,
   the RBAC suite (cross-project isolation, viewer/editor role floor,
-  `created_by` attribution), and the relations suite described above
-  (create/fetch, cross-project rejection, self-reference + to-many,
-  draft/published snapshot independence, author-ownership enforcement,
-  delivery-API private-field redaction).
+  `created_by` attribution), and the full relations suite (15 tests —
+  see the "Relations" section above for what each one covers).
 - **Fixed (independent audit finding)**: the test harness used to
   `t.Skip` whenever it couldn't reach the test database, with no
   distinction between "no `TEST_DATABASE_URL` set, probably a laptop
@@ -233,12 +296,13 @@ prerequisite for both, now unblocked).
   make again in any other hand-rolled Go HTTP client/test code in this
   repo.
 
-Still missing: `go test -race` was attempted but can't run in this
-environment (`-race` needs cgo, which needs a C compiler; none is
-installed) — needs a machine with gcc/clang, or that installed here,
-before it can run. No Playwright/Vitest for the frontend, no fuzz tests
-for the query parser (the query parser itself doesn't exist yet), no CI
-pipeline wiring any of this to run automatically on push.
+Still missing locally: `go test -race` can't run on this Windows dev
+machine (`-race` needs cgo, which needs a C compiler; none is
+installed) — but it now runs in CI on the Linux `backend` job (see
+Phase 0 above), so it isn't permanently stuck, just not runnable from
+this specific environment. No Playwright/Vitest for the frontend, no
+fuzz tests for the query parser (the query parser itself doesn't exist
+yet).
 
 ## Known gaps / explicitly NOT_STARTED (tracked, not forgotten)
 
@@ -257,10 +321,13 @@ did not implement. None of it is silently dropped — it's the next work.
 - **Schema migrations**: content types can be created but not edited
   (rename/remove field, change type, etc.) or migrated. No migration plan
   generation, no destructive-change confirmation flow.
-- **Relations**: implemented (see the dedicated section above) —
-  except reverse-uniqueness for one_to_one/many_to_one, tracked as a
-  known gap there. **Components, dynamic zones**: still not implemented
-  at all (relations were a prerequisite for both; now unblocked).
+- **Relations**: implemented, including document identity/FK integrity,
+  correct cardinality (including DB-enforced one_to_one
+  reverse-uniqueness), locale-aware expansion, and unpublished-target
+  filtering (see the dedicated section above). The one remaining gap
+  there is a real concurrency regression test, not a missing feature.
+  **Components, dynamic zones**: still not implemented at all
+  (relations were a prerequisite for both; now unblocked).
 - **Localization**: `locale` column exists and is threaded through, but
   there's no locale configuration, fallback, or per-locale publish UI.
 - **Revisions**: publish overwrites the single published row; there is no
@@ -276,9 +343,10 @@ did not implement. None of it is silently dropped — it's the next work.
   cursor pagination yet.
 - **Caching (Redis)**: not wired up anywhere yet.
 - **Benchmarks, k6 suite, Strapi comparison**: not started.
-- **Tests**: zero automated tests exist yet (no Go unit/integration
-  tests, no Vitest, no Playwright). Everything above was verified manually
-  via curl and the browser pane in this session, not via a test suite.
+- **Tests**: stale line removed — see the dedicated "Tests" section
+  above; Go unit and integration tests exist and run in CI. Still
+  missing: Vitest/Playwright for the frontend (the frontend itself was
+  only ever verified manually via the browser pane).
 - **CORS/production config**: CORS origins are read from an env var and
   default to none (safe default) but aren't documented beyond the README.
 - **go:embed / single-binary deploy, Caddy config, backup/restore
@@ -288,20 +356,28 @@ did not implement. None of it is silently dropped — it's the next work.
 ## Exact next steps
 
 1. Components and dynamic zones next (relations, their prerequisite, are
-   now done), then media (single/multiple media fields need the media
-   library to exist first). Add integration tests as they're built,
-   following the pattern in `tests/integration/`, not after.
+   now done — including the integrity hardening an independent audit
+   asked for), then media (single/multiple media fields need the media
+   library to exist first). Use `schema.Field.ID` for their own nested
+   field identity from the start, not display names, for the same
+   rename-safety reason relations now do. Add integration tests as
+   they're built, following the pattern in `tests/integration/`, not
+   after.
 2. Admin UI: no relations UI yet (picking a related entry, seeing
    expanded relations), no member-management UI (currently API-only).
    Both API-only today, both real gaps.
-3. The one_to_one/many_to_one reverse-uniqueness gap in
-   `docs/adr/0002-relations.md` — needs either a schema change to
-   `entry_relations` (so a unique index can be scoped by content-type +
-   field) or an application-level check inside the write transaction.
-4. Install a C compiler so `go test -race` can actually run, then run it.
-5. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
+3. A real concurrency regression test for `Publish`'s `FOR UPDATE` lock
+   (two goroutines racing `Update`/`Publish` against the same document)
+   — the known gap called out at the end of the Relations section.
+4. A "delete a document" API — the FK cascades added in
+   migrations/0004 are verified at the database level
+   (`TestDocumentDeletionCascadesToEntriesAndRelations`) but there's
+   nothing in the HTTP API that reaches them yet.
+5. Install a C compiler on this dev machine so `go test -race` can run
+   locally too, not just in CI.
+6. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
    verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
    build and run.
-6. `.github/workflows/ci.yml` now exists (see Phase 0 above) but its
+7. `.github/workflows/ci.yml` now exists (see Phase 0 above) but its
    first real run on GitHub hasn't been observed from this environment
    — confirm it's actually green, not just plausible-looking YAML.

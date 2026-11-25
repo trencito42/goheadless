@@ -43,6 +43,11 @@ jobs:
             exit 1
           fi
       - run: go test ./...
+      # -race needs cgo, which needs a C compiler. The Windows dev
+      # machine this project was built on doesn't have one installed
+      # (see PROGRESS.md), but ubuntu-latest ships gcc, so it runs here
+      # instead of being skipped indefinitely.
+      - run: go test -race ./...
 
   frontend:
     runs-on: ubuntu-latest

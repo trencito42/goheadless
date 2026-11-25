@@ -45,8 +45,14 @@ yet — this is the hand-written source of truth until that lands.
 - `POST .../{collection}/{documentID}/publish` — `?locale=` optional.
   Re-validates the draft (including its current relation values) and
   copies its relation snapshot onto the published row — see
-  `docs/adr/0002-relations.md`.
+  `docs/adr/0002-relations.md` and `docs/adr/0003-document-identity.md`.
+  409 (`ErrRelationConflict`) if a `one_to_one` relation field's target
+  is already claimed by another document's published row through the
+  same field.
 - `POST .../{collection}/{documentID}/unpublish`.
+
+`POST`/`PATCH` on content also return 409 `ErrRelationConflict` for the
+same `one_to_one` reason.
 
 ## Delivery API (published only)
 
@@ -62,6 +68,15 @@ yet; only `limit`/`offset`. Fields marked `"private": true` on the
 content type are stripped from every delivery-API response (both list
 and get) but remain visible on the management (draft) API, since
 editors need to see and edit them.
+
+A delivery read also never hands back a relation stub id that doesn't
+resolve to an actual published document in the requested locale (a
+to-one stub becomes `null`, a to-many stub drops that entry): a source
+document's own last publish can go stale if its *target* gets
+unpublished afterward, and the delivery API treats that as "no
+relation" rather than delivering an id a client can't do anything with.
+The management (draft) API shows the raw stub regardless, since editors
+need to see and fix it.
 
 ### Relation fields and `?include=`
 
@@ -81,9 +96,11 @@ GET /api/v1/projects/{projectID}/content/post/{documentID}?include=author
 
 Expansion is always one query per included field (never one per entry,
 never recursive — an expanded entry's own relation fields are left as
-stubs), and its `data` always has that content type's private fields
-redacted, regardless of whether the outer request is a draft or
-delivery read.
+stubs), is scoped to the same `locale` as the outer request (a target
+with published rows in several locales only ever resolves to the one
+matching the request), and its `data` always has that content type's
+private fields redacted, regardless of whether the outer request is a
+draft or delivery read.
 
 Draft and published variants of the same document hold **independent**
 relation snapshots: editing a draft's relation field never changes what

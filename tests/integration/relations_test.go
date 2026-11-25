@@ -1,8 +1,12 @@
 package integration
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // setupBlogWithAuthorAndComment creates a project with two related
@@ -38,6 +42,9 @@ func setupBlogWithAuthorAndComment(t *testing.T, env *testEnv) (owner *client, p
 			}},
 			{"name": "related", "type": "relation", "relation": map[string]any{
 				"targetContentType": "post", "relationType": "one_to_many",
+			}},
+			{"name": "featuredAuthor", "type": "relation", "relation": map[string]any{
+				"targetContentType": "author", "relationType": "one_to_one",
 			}},
 		}},
 	})
@@ -160,6 +167,12 @@ func TestRelationDraftAndPublishedAreIndependentSnapshots(t *testing.T) {
 		"data": map[string]any{"name": "Grace"},
 	})
 	authorBID := authorB["documentId"].(string)
+	// Both targets need their own published variant, or the delivery API's
+	// unpublished-target filtering (see relations.go filterUndeliverableTargets)
+	// would correctly null out the stub regardless of snapshot independence,
+	// and this test wants to isolate the snapshot-independence behavior.
+	owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorAID+"/publish", nil)
+	owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorBID+"/publish", nil)
 
 	resp, post := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
 		"data": map[string]any{"title": "Hello", "author": authorAID},
@@ -291,4 +304,211 @@ func TestDeliveryAPIRedactsPrivateFields(t *testing.T) {
 	if published["data"].(map[string]any)["name"] != "Ada" {
 		t.Fatalf("expected public field to still be present, got %v", published["data"])
 	}
+}
+
+func TestManyToOneAllowsMultipleSourcesToSameTarget(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupBlogWithAuthorAndComment(t, env)
+
+	_, author := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/", map[string]any{
+		"data": map[string]any{"name": "Ada"},
+	})
+	authorID := author["documentId"].(string)
+	owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorID+"/publish", nil)
+
+	for i, title := range []string{"First post", "Second post"} {
+		resp, post := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+			"data": map[string]any{"title": title, "author": authorID},
+		})
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create post %d: %d %v", i, resp.StatusCode, post)
+		}
+		postID := post["documentId"].(string)
+		resp, published := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+postID+"/publish", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("many_to_one must allow multiple published sources to reference the same target, post %d: %d %v", i, resp.StatusCode, published)
+		}
+		if published["data"].(map[string]any)["author"] != authorID {
+			t.Fatalf("post %d: expected author %q, got %v", i, authorID, published["data"])
+		}
+	}
+}
+
+func TestOneToOneRejectsSecondPublishedReferenceButAllowsConcurrentDrafts(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupBlogWithAuthorAndComment(t, env)
+
+	_, author := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/", map[string]any{
+		"data": map[string]any{"name": "Ada"},
+	})
+	authorID := author["documentId"].(string)
+	owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorID+"/publish", nil)
+
+	_, post1 := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Spotlight 1", "featuredAuthor": authorID},
+	})
+	post1ID := post1["documentId"].(string)
+
+	// Two different documents' DRAFTS are allowed to transiently both
+	// point at the same one_to_one target — the conflict is only real
+	// once one of them actually publishes (see docs/adr/0003).
+	resp, post2 := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Spotlight 2", "featuredAuthor": authorID},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected two drafts to both be allowed to target the same one_to_one target: %d %v", resp.StatusCode, post2)
+	}
+	post2ID := post2["documentId"].(string)
+
+	resp, published1 := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+post1ID+"/publish", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish post1: %d %v", resp.StatusCode, published1)
+	}
+
+	resp, body := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+post2ID+"/publish", nil)
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 publishing a second one_to_one reference to an already-published target, got %d %v", resp.StatusCode, body)
+	}
+}
+
+func TestDeliveryFiltersUnpublishedRelationTargets(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupBlogWithAuthorAndComment(t, env)
+
+	// Author is created but never published.
+	_, author := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/", map[string]any{
+		"data": map[string]any{"name": "Ada"},
+	})
+	authorID := author["documentId"].(string)
+
+	_, post := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Hello", "author": authorID},
+	})
+	postID := post["documentId"].(string)
+	resp, published := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+postID+"/publish", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish: %d %v", resp.StatusCode, published)
+	}
+
+	// Draft/management read still shows the stub — editors need to see
+	// it to notice and fix the dangling reference.
+	resp, draft := owner.do(http.MethodGet, "/api/v1/manage/projects/"+projectID+"/content/post/"+postID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get draft: %d %v", resp.StatusCode, draft)
+	}
+	if draft["data"].(map[string]any)["author"] != authorID {
+		t.Fatalf("expected draft read to still show the unpublished-target stub, got %v", draft["data"])
+	}
+
+	// Delivery read must NOT deliver an id that doesn't resolve to a
+	// published document — the author was never published.
+	resp, deliveryPost := owner.do(http.MethodGet, "/api/v1/projects/"+projectID+"/content/post/"+postID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get published post: %d %v", resp.StatusCode, deliveryPost)
+	}
+	if got := deliveryPost["data"].(map[string]any)["author"]; got != nil {
+		t.Fatalf("delivery API delivered an unpublished target's id %v instead of null", got)
+	}
+}
+
+func TestLocaleAwareRelationExpansion(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupBlogWithAuthorAndComment(t, env)
+
+	resp, author := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/", map[string]any{
+		"data": map[string]any{"name": "Ada"},
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create author: %d %v", resp.StatusCode, author)
+	}
+	authorID := author["documentId"].(string)
+	contentTypeID := author["contentTypeId"].(string)
+	resp, publishedAuthor := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorID+"/publish", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish author: %d %v", resp.StatusCode, publishedAuthor)
+	}
+
+	// Simulate a second locale variant of the SAME document by inserting
+	// directly (there is no API to add a locale to an existing document
+	// yet — see PROGRESS.md localization gaps). Without locale filtering,
+	// expandIncludes' target lookup would match either row nondeterministically.
+	frData, err := json.Marshal(map[string]any{"name": "Adalisa"})
+	if err != nil {
+		t.Fatalf("marshal fr data: %v", err)
+	}
+	_, err = env.pool.Exec(context.Background(), `
+		INSERT INTO entries (project_id, content_type_id, document_id, locale, status, data)
+		VALUES ($1, $2, $3, 'fr', 'published', $4)`,
+		mustParseUUID(t, projectID), mustParseUUID(t, contentTypeID), mustParseUUID(t, authorID), frData)
+	if err != nil {
+		t.Fatalf("insert fr variant: %v", err)
+	}
+
+	_, post := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Hello", "author": authorID},
+	})
+	postID := post["documentId"].(string)
+	resp, publishedPost := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/"+postID+"/publish", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("publish post: %d %v", resp.StatusCode, publishedPost)
+	}
+
+	resp, got := owner.do(http.MethodGet, "/api/v1/projects/"+projectID+"/content/post/"+postID+"?locale=en&include=author", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get published post with include: %d %v", resp.StatusCode, got)
+	}
+	authorExpanded, ok := got["data"].(map[string]any)["author"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected expanded author object, got %v", got["data"].(map[string]any)["author"])
+	}
+	name := authorExpanded["data"].(map[string]any)["name"]
+	if name != "Ada" {
+		t.Fatalf("expected locale=en expansion to resolve the EN author row (name %q), got %q — locale filtering regressed", "Ada", name)
+	}
+}
+
+func TestDocumentDeletionCascadesToEntriesAndRelations(t *testing.T) {
+	env := newTestEnv(t)
+	owner, projectID := setupBlogWithAuthorAndComment(t, env)
+
+	_, author := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/", map[string]any{
+		"data": map[string]any{"name": "Ada"},
+	})
+	authorID := author["documentId"].(string)
+	owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorID+"/publish", nil)
+
+	_, post := owner.do(http.MethodPost, "/api/v1/manage/projects/"+projectID+"/content/post/", map[string]any{
+		"data": map[string]any{"title": "Hello", "author": authorID},
+	})
+	postID := post["documentId"].(string)
+
+	// There is no "delete a document" API yet (see PROGRESS.md), so this
+	// exercises the FK cascade (documents -> entries, documents ->
+	// entry_relations.to_document_id) directly against the database —
+	// it's the mechanism a future delete endpoint would rely on.
+	if _, err := env.pool.Exec(context.Background(), `DELETE FROM documents WHERE id = $1`, mustParseUUID(t, authorID)); err != nil {
+		t.Fatalf("delete document: %v", err)
+	}
+
+	resp, body := owner.do(http.MethodGet, "/api/v1/manage/projects/"+projectID+"/content/author/"+authorID, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected the author's entries rows to be gone after its document was deleted, got %d %v", resp.StatusCode, body)
+	}
+
+	resp, draft := owner.do(http.MethodGet, "/api/v1/manage/projects/"+projectID+"/content/post/"+postID, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get post after target deletion: %d %v", resp.StatusCode, draft)
+	}
+	if got := draft["data"].(map[string]any)["author"]; got != nil {
+		t.Fatalf("expected the relation to the deleted document to be gone (cascaded), got %v", got)
+	}
+}
+
+func mustParseUUID(t *testing.T, s string) uuid.UUID {
+	t.Helper()
+	id, err := uuid.Parse(s)
+	if err != nil {
+		t.Fatalf("parse uuid %q: %v", s, err)
+	}
+	return id
 }

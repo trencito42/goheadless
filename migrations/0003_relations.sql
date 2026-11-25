@@ -11,12 +11,14 @@
 -- (e.g. by Unpublish) automatically cleans up its own relation rows
 -- without application code having to do it.
 --
--- to_document_id intentionally has no FK: a document has no single
--- table of its own (it's just a value shared by its draft/published
--- rows), so there is nothing a foreign key could point at. Existence,
--- project and content-type matching for the target are enforced in
+-- to_document_id originally had no FK here: a document had no single
+-- table of its own (it was just a value shared by its draft/published
+-- rows), so there was nothing a foreign key could point at. Existence,
+-- project and content-type matching for the target were enforced in
 -- application code (internal/content) at write time instead — see
--- docs/adr/0002-relations.md.
+-- docs/adr/0002-relations.md. migrations/0004 introduces a real
+-- `documents` table and adds that FK (plus field_id, from_document_id,
+-- status and relation_type columns) — see docs/adr/0003-document-identity.md.
 
 CREATE TABLE entry_relations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

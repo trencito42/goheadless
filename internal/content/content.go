@@ -74,9 +74,6 @@ func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale
 	if err != nil {
 		return Entry{}, fmt.Errorf("validation failed: %w", err)
 	}
-	if err := s.validateRelationTargets(ctx, projectID, ct.Schema, relationValues); err != nil {
-		return Entry{}, err
-	}
 	if locale == "" {
 		locale = "en"
 	}
@@ -93,6 +90,16 @@ func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale
 	}
 	defer tx.Rollback(ctx)
 
+	if err := validateRelationTargets(ctx, tx, s.registry, projectID, ct.Schema, relationValues); err != nil {
+		return Entry{}, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO documents (id, project_id, content_type_id) VALUES ($1, $2, $3)`,
+		documentID, projectID, ct.ID); err != nil {
+		return Entry{}, fmt.Errorf("insert document: %w", err)
+	}
+
 	var e Entry
 	err = tx.QueryRow(ctx, `
 		INSERT INTO entries (project_id, content_type_id, document_id, locale, status, data, created_by)
@@ -103,7 +110,7 @@ func (s *Service) Create(ctx context.Context, projectID uuid.UUID, apiID, locale
 	if err != nil {
 		return Entry{}, fmt.Errorf("insert entry: %w", err)
 	}
-	if err := setRelations(ctx, tx, projectID, e.ID, relationValues); err != nil {
+	if err := setRelations(ctx, tx, projectID, e.ID, documentID, StatusDraft, ct.Schema.RelationFields(), relationValues); err != nil {
 		return Entry{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -137,9 +144,6 @@ func (s *Service) Update(ctx context.Context, projectID uuid.UUID, apiID string,
 	if err != nil {
 		return Entry{}, fmt.Errorf("validation failed: %w", err)
 	}
-	if err := s.validateRelationTargets(ctx, projectID, ct.Schema, relationValues); err != nil {
-		return Entry{}, err
-	}
 	if locale == "" {
 		locale = "en"
 	}
@@ -153,6 +157,10 @@ func (s *Service) Update(ctx context.Context, projectID uuid.UUID, apiID string,
 		return Entry{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	if err := validateRelationTargets(ctx, tx, s.registry, projectID, ct.Schema, relationValues); err != nil {
+		return Entry{}, err
+	}
 
 	var existingID uuid.UUID
 	var existingCreatedBy *uuid.UUID
@@ -187,7 +195,7 @@ func (s *Service) Update(ctx context.Context, projectID uuid.UUID, apiID string,
 	if err != nil {
 		return Entry{}, fmt.Errorf("update entry: %w", err)
 	}
-	if err := setRelations(ctx, tx, projectID, e.ID, relationValues); err != nil {
+	if err := setRelations(ctx, tx, projectID, e.ID, documentID, StatusDraft, ct.Schema.RelationFields(), relationValues); err != nil {
 		return Entry{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -223,11 +231,19 @@ func (s *Service) Publish(ctx context.Context, projectID uuid.UUID, apiID string
 	}
 	defer tx.Rollback(ctx)
 
+	// FOR UPDATE locks the draft row for the rest of this transaction:
+	// without it, a concurrent Update() could commit a new data+relation
+	// snapshot between this read and copyRelations' read of the
+	// relations below, and this Publish would end up combining the OLD
+	// data with the NEW relations (or vice versa) — a draft/published
+	// snapshot that was never actually true at any single instant. The
+	// lock makes Update() block until this transaction finishes instead.
 	var draftID uuid.UUID
 	var draftData []byte
 	err = tx.QueryRow(ctx, `
 		SELECT id, data FROM entries
-		WHERE project_id = $1 AND content_type_id = $2 AND document_id = $3 AND locale = $4 AND status = $5`,
+		WHERE project_id = $1 AND content_type_id = $2 AND document_id = $3 AND locale = $4 AND status = $5
+		FOR UPDATE`,
 		projectID, ct.ID, documentID, locale, StatusDraft,
 	).Scan(&draftID, &draftData)
 	if err == pgx.ErrNoRows {
@@ -244,7 +260,7 @@ func (s *Service) Publish(ctx context.Context, projectID uuid.UUID, apiID string
 
 	relFields := ct.Schema.RelationFields()
 	if len(relFields) > 0 {
-		draftRelations, err := loadRelationIDs(ctx, tx, draftID)
+		draftRelations, err := loadRelationIDs(ctx, tx, draftID, relFields)
 		if err != nil {
 			return Entry{}, err
 		}
@@ -269,7 +285,7 @@ func (s *Service) Publish(ctx context.Context, projectID uuid.UUID, apiID string
 	if err != nil {
 		return Entry{}, fmt.Errorf("promote to published: %w", err)
 	}
-	if err := copyRelations(ctx, tx, projectID, draftID, e.ID, relFields); err != nil {
+	if err := copyRelations(ctx, tx, projectID, draftID, e.ID, documentID, StatusPublished, relFields); err != nil {
 		return Entry{}, err
 	}
 
@@ -358,7 +374,12 @@ func (s *Service) List(ctx context.Context, projectID uuid.UUID, apiID, status, 
 	if err := s.attachRelations(ctx, projectID, ct.Schema, out); err != nil {
 		return nil, err
 	}
-	if err := s.expandIncludes(ctx, projectID, ct.Schema, status, out, include); err != nil {
+	if redactPrivateFields {
+		if err := s.filterUndeliverableTargets(ctx, projectID, ct.Schema, locale, out); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.expandIncludes(ctx, projectID, ct.Schema, status, locale, out, include); err != nil {
 		return nil, err
 	}
 	if redactPrivateFields {
@@ -399,7 +420,12 @@ func (s *Service) Get(ctx context.Context, projectID uuid.UUID, apiID string, do
 	if err := s.attachRelations(ctx, projectID, ct.Schema, entries); err != nil {
 		return Entry{}, err
 	}
-	if err := s.expandIncludes(ctx, projectID, ct.Schema, status, entries, include); err != nil {
+	if redactPrivateFields {
+		if err := s.filterUndeliverableTargets(ctx, projectID, ct.Schema, locale, entries); err != nil {
+			return Entry{}, err
+		}
+	}
+	if err := s.expandIncludes(ctx, projectID, ct.Schema, status, locale, entries, include); err != nil {
 		return Entry{}, err
 	}
 	if redactPrivateFields {

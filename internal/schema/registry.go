@@ -101,6 +101,11 @@ func (r *Registry) Create(ctx context.Context, projectID uuid.UUID, apiID, displ
 	if err := def.Validate(); err != nil {
 		return ContentType{}, fmt.Errorf("invalid schema: %w", err)
 	}
+	for i, f := range def.Fields {
+		if f.ID == uuid.Nil {
+			def.Fields[i].ID = uuid.New()
+		}
+	}
 	for _, f := range def.RelationFields() {
 		if f.Relation.TargetContentType == apiID {
 			continue // self-referencing: the target is this content type itself.

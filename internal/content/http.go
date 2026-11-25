@@ -65,6 +65,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	e, err := h.svc.Create(r.Context(), projectID, apiID, req.Locale, user.ID, req.Data)
 	if err != nil {
+		if errors.Is(err, ErrRelationConflict) {
+			httpx.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -124,6 +128,10 @@ func (h *Handler) Publish(w http.ResponseWriter, r *http.Request) {
 	locale := r.URL.Query().Get("locale")
 	e, err := h.svc.Publish(r.Context(), projectID, apiID, documentID, locale)
 	if err != nil {
+		if errors.Is(err, ErrRelationConflict) {
+			httpx.WriteError(w, http.StatusConflict, err.Error())
+			return
+		}
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
