@@ -4,10 +4,10 @@
 //
 // This is a deliberately small subset of the full field-type catalogue
 // (see docs/ROADMAP.md) covering the types needed for the first vertical
-// slice: short_text, long_text, rich_text, integer, decimal, boolean,
-// email, url, date, datetime, enumeration, json. Relations, components,
-// dynamic zones and media fields are tracked as NOT_STARTED in
-// PROGRESS.md.
+// slice plus relations: short_text, long_text, rich_text, integer,
+// decimal, boolean, email, url, date, datetime, enumeration, json,
+// relation. Components, dynamic zones and media fields are tracked as
+// NOT_STARTED in PROGRESS.md.
 package schema
 
 import (
@@ -17,6 +17,8 @@ import (
 	"net/url"
 	"regexp"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type FieldType string
@@ -34,13 +36,43 @@ const (
 	FieldDateTime    FieldType = "datetime"
 	FieldEnumeration FieldType = "enumeration"
 	FieldJSON        FieldType = "json"
+	FieldRelation    FieldType = "relation"
 )
 
 var validFieldTypes = map[FieldType]bool{
 	FieldShortText: true, FieldLongText: true, FieldRichText: true,
 	FieldInteger: true, FieldDecimal: true, FieldBoolean: true,
 	FieldEmail: true, FieldURL: true, FieldDate: true, FieldDateTime: true,
-	FieldEnumeration: true, FieldJSON: true,
+	FieldEnumeration: true, FieldJSON: true, FieldRelation: true,
+}
+
+type RelationType string
+
+const (
+	RelationOneToOne   RelationType = "one_to_one"
+	RelationOneToMany  RelationType = "one_to_many"
+	RelationManyToOne  RelationType = "many_to_one"
+	RelationManyToMany RelationType = "many_to_many"
+)
+
+var validRelationTypes = map[RelationType]bool{
+	RelationOneToOne: true, RelationOneToMany: true,
+	RelationManyToOne: true, RelationManyToMany: true,
+}
+
+// RelationConfig describes what a "relation" field points at. The
+// target is always a content type API id within the *same* project —
+// cross-project references are rejected (internal/content enforces
+// this; schema.Validate can't, since it has no database access).
+type RelationConfig struct {
+	TargetContentType string       `json:"targetContentType"`
+	RelationType      RelationType `json:"relationType"`
+}
+
+// IsToMany reports whether a relation field's value is a list (true for
+// one_to_many/many_to_many) or a single related document (false).
+func (rc RelationConfig) IsToMany() bool {
+	return rc.RelationType == RelationOneToMany || rc.RelationType == RelationManyToMany
 }
 
 // reservedFieldNames collide with infrastructure columns/metadata and
@@ -68,6 +100,10 @@ type Field struct {
 	HelpText    string    `json:"helpText,omitempty"`
 	Placeholder string    `json:"placeholder,omitempty"`
 	DisplayName string    `json:"displayName,omitempty"`
+
+	// Relation is required when Type == FieldRelation, and ignored
+	// otherwise.
+	Relation *RelationConfig `json:"relation,omitempty"`
 }
 
 type Definition struct {
@@ -96,6 +132,14 @@ func (d Definition) Validate() error {
 		}
 		if f.Type == FieldEnumeration && len(f.Enum) == 0 {
 			return fmt.Errorf("field %q: enumeration fields require at least one value", f.Name)
+		}
+		if f.Type == FieldRelation {
+			if f.Relation == nil || f.Relation.TargetContentType == "" {
+				return fmt.Errorf("field %q: relation fields require a targetContentType", f.Name)
+			}
+			if !validRelationTypes[f.Relation.RelationType] {
+				return fmt.Errorf("field %q: unknown relationType %q", f.Name, f.Relation.RelationType)
+			}
 		}
 	}
 	return nil
@@ -221,8 +265,58 @@ func validateField(f Field, value any) error {
 		if _, err := json.Marshal(value); err != nil {
 			return fmt.Errorf("not valid JSON")
 		}
+	case FieldRelation:
+		return validateRelationValue(f, value)
 	}
 	return nil
+}
+
+// validateRelationValue only checks shape (a document id, or a list of
+// them, matching the field's cardinality) — whether those documents
+// actually exist, belong to the same project, and match the target
+// content type is checked by internal/content, which has the database
+// access schema.Definition deliberately doesn't.
+func validateRelationValue(f Field, value any) error {
+	if f.Relation == nil {
+		return fmt.Errorf("field has no relation configuration")
+	}
+	if f.Relation.IsToMany() {
+		items, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("expected a list of document ids")
+		}
+		for _, item := range items {
+			if err := validateDocumentIDString(item); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return validateDocumentIDString(value)
+}
+
+func validateDocumentIDString(value any) error {
+	s, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("expected a document id string")
+	}
+	if _, err := uuid.Parse(s); err != nil {
+		return fmt.Errorf("%q is not a valid document id", s)
+	}
+	return nil
+}
+
+// RelationFields returns the fields of this definition that are
+// relations, for callers (internal/content) that need to handle them
+// separately from ordinary JSONB-stored fields.
+func (d Definition) RelationFields() []Field {
+	var out []Field
+	for _, f := range d.Fields {
+		if f.Type == FieldRelation {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func checkRange(f Field, n float64) error {

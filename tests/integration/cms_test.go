@@ -4,10 +4,13 @@
 // publish lifecycle, cross-project isolation).
 //
 // Requires TEST_DATABASE_URL (defaults to a local "cms_test" database
-// matching the dev setup in README.md). Skips instead of failing if it
-// can't connect, so `go test ./...` still passes on a machine with no
-// Postgres — but these tests not running is not the same as them
-// passing; see PROGRESS.md.
+// matching the dev setup in README.md). Skips if it can't connect only
+// when TEST_DATABASE_URL was left unset — a developer machine with no
+// Postgres running — so `go test ./...` still passes there, but these
+// tests not running is not the same as them passing; see PROGRESS.md.
+// When TEST_DATABASE_URL IS set (as CI always sets it) and the
+// connection still fails, that's a real environment problem and the
+// test fails loudly instead of silently skipping.
 package integration
 
 import (
@@ -33,11 +36,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func testDatabaseURL() string {
+func testDatabaseURL() (url string, explicit bool) {
 	if v := os.Getenv("TEST_DATABASE_URL"); v != "" {
-		return v
+		return v, true
 	}
-	return "postgres://cms:cms_dev_password@localhost:5432/cms_test"
+	return "postgres://cms:cms_dev_password@localhost:5432/cms_test", false
 }
 
 // testEnv is a fully wired backend against a real, freshly-truncated
@@ -54,11 +57,21 @@ func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
 	ctx := context.Background()
 
-	pool, err := storage.NewPool(ctx, testDatabaseURL())
+	dbURL, explicit := testDatabaseURL()
+	pool, err := storage.NewPool(ctx, dbURL)
 	if err != nil {
+		if explicit {
+			t.Fatalf("TEST_DATABASE_URL was set but the database is unreachable: %v", err)
+		}
 		t.Skipf("skipping integration test: cannot reach test database: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		if explicit {
+			t.Fatalf("TEST_DATABASE_URL was set but the database is unreachable: %v", err)
+		}
+		t.Skipf("skipping integration test: cannot reach test database: %v", err)
+	}
 
 	if err := storage.Migrate(ctx, pool, "../../migrations"); err != nil {
 		t.Fatalf("migrate: %v", err)

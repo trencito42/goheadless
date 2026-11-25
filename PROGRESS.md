@@ -1,6 +1,6 @@
 # PROGRESS
 
-Last updated: 2026-11-25 (RBAC + tests pass).
+Last updated: 2026-11-25 (relations + ownership fix + test-suite hardening).
 
 This tracks exactly what's real. "VERIFIED" means it was actually run and
 observed to work in this environment — not inferred from the code
@@ -96,10 +96,90 @@ write (403 on create); after being upgraded to editor, can create and the
 entry's `created_by` is correctly attributed to them.
 
 Not done: no UI for member management yet (API only — the admin frontend
-has no page for it); no field-level permissions; no "author can only
-edit their own entries" check (author can create, but update/publish
-require editor regardless of who created the entry — simpler for now,
-tracked as a real gap, not an oversight).
+has no page for it); no field-level permissions.
+
+**Fixed** (was previously tracked here as a known gap, found again in an
+independent audit): Author-role callers could edit *any* draft in the
+project, not just their own. `Service.Update` now takes the caller's id
+and whether ownership should be required; the HTTP handler passes
+`requireOwnership = role < Editor`. An Author editing someone else's
+draft now gets 403 (`content.ErrNotOwner`); Editor and above still edit
+anyone's, unchanged. VERIFIED by
+`TestAuthorCannotEditAnotherAuthorsDraftButEditorCan` in
+`tests/integration/relations_test.go` (real HTTP requests as two
+different author-role users plus an editor-promoted one, against real
+Postgres).
+
+## Relations — IMPLEMENTED and VERIFIED (migrations/0003_relations.sql)
+
+A `relation` field type (`one_to_one`, `one_to_many`, `many_to_one`,
+`many_to_many`), stored in a dedicated `entry_relations` table rather
+than the JSONB `data` column. Full design rationale in
+`docs/adr/0002-relations.md`; API shape in `docs/API.md`.
+
+- Schema: `schema.RelationConfig` (`targetContentType`, `relationType`),
+  validated structurally (`Definition.Validate`) and by value shape
+  (`validateRelationValue` — a single document-id string for to-one, a
+  list of them for to-many).
+- Registry: creating a content type with a relation field checks the
+  target content type exists in the **same project** (or is the type
+  being created itself, for self-reference) before accepting it.
+- Content service: relation values are split out of the submitted
+  `data` before it's stored as JSONB (`splitRelationFields`), validated
+  against the real `entries` table — target must exist, belong to the
+  same project, and match the configured target content type
+  (`validateRelationTargets`) — and persisted as `entry_relations` rows
+  inside the same transaction as the entries write (`setRelations`).
+- **Draft/published are independent snapshots**: `entry_relations` is
+  keyed by the specific entries *row* id (`from_entry_id`), not the
+  document id. Editing a draft's relations never changes what's
+  published until `Publish` explicitly copies the draft's current
+  relation rows onto the published row (`copyRelations`), inside the
+  same transaction that promotes its data. `Unpublish` deleting the
+  published row cascades (FK `ON DELETE CASCADE`) to clean up its
+  relation rows automatically.
+- Reads (`List`/`Get`) batch-load every entry's relations in one query
+  (`attachRelations`, keyed by a batch of row ids — never one query per
+  entry), returning bare document-id stub(s) by default.
+- `?include=fieldName` expands a relation field into the full related
+  entry's data, one query per included field (not per entry, not
+  recursive — an included entry's own relations stay as stubs, which is
+  what keeps this bounded to one level without needing cycle
+  detection).
+- **Private fields never leak through relation expansion or the
+  delivery API**: `schema.Field.Private` (existed before but was never
+  actually enforced anywhere — also found in audit) is now stripped
+  from (a) every delivery-API response (`ListPublished`/`GetPublished`)
+  and (b) every relation-expansion embed, unconditionally, regardless
+  of whether the outer read is a draft or published one (expansion has
+  no notion of the caller's permission level, so it always returns the
+  redacted projection). Private fields remain visible on the
+  authenticated management/draft API, since editors need to see and
+  edit them.
+- Cross-project relation targets are rejected — not just checked, but
+  structurally impossible, since the target content type is always
+  resolved through `registry.Get(callerProjectID, ...)`, so there is no
+  code path that could ever look at another project's rows. VERIFIED
+  by `TestRelationCrossProjectReferenceRejected`.
+- Self-referencing relations (a content type relating to itself) work.
+  VERIFIED by `TestRelationSelfReferencingAndToMany`.
+
+VERIFIED end-to-end against real Postgres in
+`tests/integration/relations_test.go`: create + fetch with a stub and
+an expanded relation (`TestRelationCreateAndFetch`), cross-project
+rejection, self-reference + to-many, draft/published snapshot
+independence across an update-then-publish sequence
+(`TestRelationDraftAndPublishedAreIndependentSnapshots`), author
+ownership enforcement, and delivery-API private-field redaction.
+
+**Known gap, not solved in this pass**: no reverse-uniqueness for
+`one_to_one`/`many_to_one` — nothing stops two different source entries
+from pointing at the same target through what's modeled as a one-to-one
+field (the DB has no way to express "unique scoped to this specific
+field of this specific content type" with the current table shape).
+Documented in `docs/adr/0002-relations.md` rather than silently assumed
+solved. Also not done: components, dynamic zones (relations are a
+prerequisite for both, now unblocked).
 
 ## Tests — now real, IMPLEMENTED and VERIFIED
 
@@ -112,14 +192,27 @@ tracked as a real gap, not an oversight).
   PostgreSQL database (`cms_test`, created alongside the dev `cms`
   database; `TEST_DATABASE_URL` overrides it), wiring the actual router
   and every real service (no mocks), driven through `httptest.Server` +
-  plain HTTP requests with manual cookie handling. Skips (not fails) if
-  the test database can't be reached. Covers: the full vertical slice
-  (project → content type → draft → publish → delivery visibility),
-  schema validation rejecting missing/unexpected fields through the real
-  HTTP path, owner-only routes rejecting a non-owner, and the RBAC suite
-  specifically asked for — cross-project isolation (non-member 403s and
-  sees an empty project list), the viewer/editor role floor, and
-  `created_by` attribution.
+  plain HTTP requests with manual cookie handling. Covers: the full
+  vertical slice (project → content type → draft → publish → delivery
+  visibility), schema validation rejecting missing/unexpected fields
+  through the real HTTP path, owner-only routes rejecting a non-owner,
+  the RBAC suite (cross-project isolation, viewer/editor role floor,
+  `created_by` attribution), and the relations suite described above
+  (create/fetch, cross-project rejection, self-reference + to-many,
+  draft/published snapshot independence, author-ownership enforcement,
+  delivery-API private-field redaction).
+- **Fixed (independent audit finding)**: the test harness used to
+  `t.Skip` whenever it couldn't reach the test database, with no
+  distinction between "no `TEST_DATABASE_URL` set, probably a laptop
+  with no Postgres running" and "CI explicitly set `TEST_DATABASE_URL`
+  and the connection still failed" — the latter is a real environment
+  problem that was silently swallowed as a pass. `newTestEnv` now
+  distinguishes the two: it still skips when the var is unset (so
+  `go test ./...` passes on a machine with no Postgres), but calls
+  `t.Fatalf` when the var **is** set and the connection (including an
+  explicit `pool.Ping`) fails. VERIFIED by manually pointing
+  `TEST_DATABASE_URL` at a wrong password / nonexistent database and
+  confirming the suite fails loudly instead of reporting skips.
 - All of `go test ./...`, `go vet ./...`, and `gofmt -l .` are clean.
 - Caught one real bug writing these: the test client's cookie-jar logic
   checked `resp.Cookies() != nil`, but `http.Response.Cookies()` returns
@@ -141,11 +234,11 @@ pipeline wiring any of this to run automatically on push.
 Everything below is real scope from the original spec that this session
 did not implement. None of it is silently dropped — it's the next work.
 
-- **Field types**: only short_text, long_text, rich_text, integer,
-  decimal, boolean, email, url, date, datetime, enumeration, json.
-  Missing: big_integer, float (separate from decimal), color, slug/UID,
-  multi-select, single/multiple media, relation, component, repeatable
-  component, dynamic zone, field groups, schema presets.
+- **Field types**: short_text, long_text, rich_text, integer, decimal,
+  boolean, email, url, date, datetime, enumeration, json, and now
+  relation. Still missing: big_integer, float (separate from decimal),
+  color, slug/UID, multi-select, single/multiple media, component,
+  repeatable component, dynamic zone, field groups, schema presets.
 - **Row-level security**: isolation is enforced in application code (every
   query scoped by project_id + the new role middleware), not at the
   database level. No Postgres RLS policies yet — see PROGRESS.md's
@@ -153,7 +246,10 @@ did not implement. None of it is silently dropped — it's the next work.
 - **Schema migrations**: content types can be created but not edited
   (rename/remove field, change type, etc.) or migrated. No migration plan
   generation, no destructive-change confirmation flow.
-- **Relations, components, dynamic zones**: not implemented at all.
+- **Relations**: implemented (see the dedicated section above) —
+  except reverse-uniqueness for one_to_one/many_to_one, tracked as a
+  known gap there. **Components, dynamic zones**: still not implemented
+  at all (relations were a prerequisite for both; now unblocked).
 - **Localization**: `locale` column exists and is threaded through, but
   there's no locale configuration, fallback, or per-locale publish UI.
 - **Revisions**: publish overwrites the single published row; there is no
@@ -180,16 +276,24 @@ did not implement. None of it is silently dropped — it's the next work.
 
 ## Exact next steps
 
-1. Extend the schema engine: relations next (needed by almost everything
-   else — components, dynamic zones, and the query engine's expansion all
-   depend on it), then media (single/multiple media fields need the media
-   library to exist first). Add integration tests for relations as they're
-   built, following the pattern in `tests/integration/`, not after.
-2. Admin UI for member management (currently API-only).
-3. Install a C compiler so `go test -race` can actually run, then run it.
-4. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
+1. Components and dynamic zones next (relations, their prerequisite, are
+   now done), then media (single/multiple media fields need the media
+   library to exist first). Add integration tests as they're built,
+   following the pattern in `tests/integration/`, not after.
+2. Admin UI: no relations UI yet (picking a related entry, seeing
+   expanded relations), no member-management UI (currently API-only).
+   Both API-only today, both real gaps.
+3. The one_to_one/many_to_one reverse-uniqueness gap in
+   `docs/adr/0002-relations.md` — needs either a schema change to
+   `entry_relations` (so a unique index can be scoped by content-type +
+   field) or an application-level check inside the write transaction.
+4. Install a C compiler so `go test -race` can actually run, then run it.
+5. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
    verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
    build and run.
-5. Wire CI (even a minimal GitHub Actions workflow running `go test ./...`
+6. Wire CI (even a minimal GitHub Actions workflow running `go test ./...`
    against a Postgres service container, plus the frontend typecheck) —
    there isn't one yet, so none of the above is enforced automatically.
+   Since CI would set `TEST_DATABASE_URL` explicitly, the integration
+   suite now fails the build (rather than skipping) if that database is
+   unreachable there — see the Tests section above.

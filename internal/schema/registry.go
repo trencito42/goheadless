@@ -101,6 +101,22 @@ func (r *Registry) Create(ctx context.Context, projectID uuid.UUID, apiID, displ
 	if err := def.Validate(); err != nil {
 		return ContentType{}, fmt.Errorf("invalid schema: %w", err)
 	}
+	for _, f := range def.RelationFields() {
+		if f.Relation.TargetContentType == apiID {
+			continue // self-referencing: the target is this content type itself.
+		}
+		var exists bool
+		err := r.pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM content_types WHERE project_id = $1 AND api_id = $2)`,
+			projectID, f.Relation.TargetContentType,
+		).Scan(&exists)
+		if err != nil {
+			return ContentType{}, fmt.Errorf("check relation target: %w", err)
+		}
+		if !exists {
+			return ContentType{}, fmt.Errorf("field %q: relation target content type %q does not exist in this project", f.Name, f.Relation.TargetContentType)
+		}
+	}
 
 	schemaBytes, err := json.Marshal(def)
 	if err != nil {
