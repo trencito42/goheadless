@@ -51,9 +51,10 @@ compiling.
   is otherwise developed on has no C compiler for cgo (see Tests
   below) — Linux runners ship gcc, so this is the one place `-race`
   actually runs, not a second skip.
-- `docs/adr/` — stale note removed: four ADRs exist (0001 hybrid
+- `docs/adr/` — stale note removed: five ADRs exist (0001 hybrid
   storage, 0002 relations, 0003 document identity/relation integrity,
-  0004 field-id backfill/cardinality/deletion-policy), not zero.
+  0004 field-id backfill/cardinality/deletion-policy, 0005
+  components/dynamic zones), not zero.
 
 ## Phase 1 — First vertical slice: IMPLEMENTED and VERIFIED end-to-end
 
@@ -297,9 +298,47 @@ blocks the entire time the lock is held, only completing once it's
 released, deterministically (no sleep-and-hope timing: it asserts
 non-completion within a bounded wait, then waits unboundedly for
 completion after releasing the lock). The lock's correctness is no
-longer argued from code review alone. Still not done: components,
-dynamic zones (relations were the prerequisite for both; now
-unblocked).
+longer argued from code review alone.
+
+## Components and dynamic zones — IMPLEMENTED and VERIFIED (no migration needed)
+
+`component` (including `repeatable`) and `dynamic_zone` field types.
+Full design rationale in `docs/adr/0005-components.md`; API shape in
+`docs/API.md`.
+
+- Stored inline in the owning entry's `data` JSONB — no new table, no
+  new migration, unlike relations. A component's value is a nested
+  JSON object (or list of them, if `repeatable`); a dynamic zone's
+  value is always a list, each item tagged `"__component": "<name>"`
+  saying which of the field's named component types it is.
+- `schema.ComponentConfig`/`DynamicZoneConfig`, validated recursively:
+  `Definition.Validate` walks into a component's/each dynamic-zone
+  component's own `Fields` the same way it validates a top-level
+  schema, and `ValidateEntry` validates nested data the same way
+  (`validateComponentValue`/`validateDynamicZoneValue`), so a missing
+  required nested field or a dynamic-zone item naming an unknown
+  component is rejected with a message naming exactly where in the
+  nesting it failed.
+- `schema.Field.ID` is assigned recursively (`Registry.Create`'s
+  `assignFieldIDs` walks into nested fields too), and duplicate-id
+  rejection is checked against one id set shared across the whole
+  recursion — a nested field's id can't collide with a sibling
+  anywhere else in the schema, component boundaries included.
+- **Deliberate scope cuts, not oversights** (see ADR 0005 for why):
+  a component/dynamic zone's own fields may not themselves be a
+  relation (no from-entry identity for a nested JSON value to key
+  `entry_relations` by) or another component/dynamic zone (bounds
+  nesting to one level for this first pass). Both are rejected with a
+  400 at content-type creation, verified by
+  `TestComponentRejectsNestedRelationField`.
+
+VERIFIED end-to-end against real Postgres in
+`tests/integration/components_test.go` (a single content type with a
+component, a repeatable component, and a dynamic zone with two allowed
+component types; create + round-trip through the real HTTP API;
+missing-required-nested-field and unknown-dynamic-zone-component
+rejection) plus `internal/schema/schema_test.go`'s structural and
+`ValidateEntry` cases for both field types.
 
 ## Tests — now real, IMPLEMENTED and VERIFIED
 
@@ -317,8 +356,9 @@ unblocked).
   visibility), schema validation rejecting missing/unexpected fields
   through the real HTTP path, owner-only routes rejecting a non-owner,
   the RBAC suite (cross-project isolation, viewer/editor role floor,
-  `created_by` attribution), and the full relations suite (17 tests —
-  see the "Relations" section above for what each one covers).
+  `created_by` attribution), the full relations suite (17 tests — see
+  the "Relations" section above for what each one covers), and the
+  components/dynamic-zones suite (2 tests — see that section above).
 - **Fixed (independent audit finding)**: the test harness used to
   `t.Skip` whenever it couldn't reach the test database, with no
   distinction between "no `TEST_DATABASE_URL` set, probably a laptop
@@ -354,10 +394,11 @@ Everything below is real scope from the original spec that this session
 did not implement. None of it is silently dropped — it's the next work.
 
 - **Field types**: short_text, long_text, rich_text, integer, decimal,
-  boolean, email, url, date, datetime, enumeration, json, and now
-  relation. Still missing: big_integer, float (separate from decimal),
-  color, slug/UID, multi-select, single/multiple media, component,
-  repeatable component, dynamic zone, field groups, schema presets.
+  boolean, email, url, date, datetime, enumeration, json, relation,
+  and now component (including repeatable) and dynamic_zone — see the
+  dedicated "Components and dynamic zones" section below. Still
+  missing: big_integer, float (separate from decimal), color, slug/UID,
+  multi-select, single/multiple media, field groups, schema presets.
 - **Row-level security**: isolation is enforced in application code (every
   query scoped by project_id + the new role middleware), not at the
   database level. No Postgres RLS policies yet — see PROGRESS.md's
@@ -374,8 +415,12 @@ did not implement. None of it is silently dropped — it's the next work.
   regression test for the publish lock (see the dedicated section
   above). No known gaps remain in this area beyond the field-type and
   localization scope tracked elsewhere on this list.
-  **Components, dynamic zones**: still not implemented at all
-  (relations were a prerequisite for both; now unblocked).
+- **Components, dynamic zones**: implemented — see the dedicated
+  section below. Known gaps: one level of nesting only (a component
+  can't contain another component/dynamic zone), and neither may
+  contain a relation field (no from-entry identity for a nested JSON
+  value to key `entry_relations` by). Both are explicit scope cuts,
+  not oversights — see `docs/adr/0005-components.md`.
 - **Localization**: `locale` column exists and is threaded through, but
   there's no locale configuration, fallback, or per-locale publish UI.
 - **Revisions**: publish overwrites the single published row; there is no
@@ -403,26 +448,25 @@ did not implement. None of it is silently dropped — it's the next work.
 
 ## Exact next steps
 
-1. Components and dynamic zones next (relations, their prerequisite, are
-   now done — including two full rounds of integrity hardening an
-   independent audit asked for), then media (single/multiple media
-   fields need the media library to exist first). Use
-   `schema.Field.ID` for their own nested field identity from the
-   start, not display names, for the same rename-safety reason
-   relations now do, and think about their own deletion-policy story
-   rather than inheriting relations' answer by default (see ADR 0004).
-   Add integration tests as they're built, following the pattern in
-   `tests/integration/`, not after.
+1. Components and dynamic zones are now done (no migration needed —
+   see the dedicated section above and ADR 0005). Media next
+   (single/multiple media fields need the media library to exist
+   first).
 2. A schema migration engine: content types can be created but not
    edited (rename/remove field, change type) or migrated — no
    migration plan generation, no destructive-change confirmation flow.
    Should build on `schema.Field.ID` (fields already survive a rename
-   at the storage layer; there's just no API to perform one yet).
-3. Admin UI: no relations UI yet (picking a related entry, seeing
-   expanded relations), no member-management UI (currently API-only).
-   Both API-only today, both real gaps.
-4. Install a C compiler on this dev machine so `go test -race` can run
+   at the storage layer, including nested component fields now; there's
+   just no API to perform one yet).
+3. A second pass at components/dynamic zones: lift the one-level
+   nesting limit, and design how a relation field could live inside a
+   component (needs component instances to have their own identity —
+   deferred, not solved, in ADR 0005).
+4. Admin UI: no relations UI yet (picking a related entry, seeing
+   expanded relations), no component/dynamic-zone editing UI, no
+   member-management UI (currently API-only). All three real gaps.
+5. Install a C compiler on this dev machine so `go test -race` can run
    locally too, not just in CI.
-5. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
+6. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
    verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
    build and run.

@@ -135,3 +135,40 @@ never changes; a client may resubmit a field's own previously-assigned
 `id` (e.g. when re-saving a content type's schema), but two different
 fields can never share one — `content-types` creation rejects that with
 a 400.
+
+### Components and dynamic zones
+
+`component` (requires `component: {fields: [...], repeatable?}`) is a
+named, nested group of fields; its value in `data` is a single JSON
+object matching `fields`, or (if `repeatable: true`) a list of them.
+`dynamic_zone` (requires `dynamicZone: {components: {name: {fields:
+[...]}, ...}}`) is always a list; each item is a JSON object with a
+`__component` key naming which of `components` it's an instance of,
+plus that component's own fields.
+
+```json
+{
+  "name": "seo", "type": "component",
+  "component": {"fields": [{"name": "metaTitle", "type": "short_text", "required": true}]}
+}
+```
+```json
+{
+  "name": "sections", "type": "dynamic_zone",
+  "dynamicZone": {"components": {
+    "quote": {"fields": [{"name": "text", "type": "short_text"}]},
+    "image": {"fields": [{"name": "url", "type": "url"}]}
+  }}
+}
+```
+```json
+{"data": {"sections": [{"__component": "quote", "text": "Hello"}]}}
+```
+
+A component or dynamic zone's own fields may **not** themselves be a
+relation, a component, or a dynamic zone — rejected with a 400 at
+content-type creation. See
+`docs/adr/0005-components.md` for why (relations need a from-entry
+identity a nested JSON value doesn't have; one level of nesting keeps
+the feature's first pass bounded). Nested fields get the same stable
+`id` top-level fields do.

@@ -3,11 +3,18 @@
 // validation rules entries are checked against before every write.
 //
 // This is a deliberately small subset of the full field-type catalogue
-// (see docs/ROADMAP.md) covering the types needed for the first vertical
-// slice plus relations: short_text, long_text, rich_text, integer,
+// (see docs/ROADMAP.md): short_text, long_text, rich_text, integer,
 // decimal, boolean, email, url, date, datetime, enumeration, json,
-// relation. Components, dynamic zones and media fields are tracked as
+// relation, component, dynamic_zone. Media fields are tracked as
 // NOT_STARTED in PROGRESS.md.
+//
+// Components and dynamic zones are nested field groups, stored inline
+// in the owning entry's JSONB data (no separate table — see
+// docs/adr/0005-components.md) and so, deliberately, may not contain
+// relation fields in this first pass: a relation needs a from_entry_id
+// to key entry_relations by, which a value nested inside JSONB doesn't
+// have one of. That restriction is enforced by Definition.Validate and
+// documented as a known gap in PROGRESS.md, not silently dropped.
 package schema
 
 import (
@@ -37,6 +44,8 @@ const (
 	FieldEnumeration FieldType = "enumeration"
 	FieldJSON        FieldType = "json"
 	FieldRelation    FieldType = "relation"
+	FieldComponent   FieldType = "component"
+	FieldDynamicZone FieldType = "dynamic_zone"
 )
 
 var validFieldTypes = map[FieldType]bool{
@@ -44,6 +53,7 @@ var validFieldTypes = map[FieldType]bool{
 	FieldInteger: true, FieldDecimal: true, FieldBoolean: true,
 	FieldEmail: true, FieldURL: true, FieldDate: true, FieldDateTime: true,
 	FieldEnumeration: true, FieldJSON: true, FieldRelation: true,
+	FieldComponent: true, FieldDynamicZone: true,
 }
 
 type RelationType string
@@ -108,6 +118,35 @@ func (rc RelationConfig) IsToMany() bool {
 	return rc.RelationType == RelationOneToMany || rc.RelationType == RelationManyToMany
 }
 
+// ComponentConfig describes a "component" field's nested shape: its own
+// set of fields, validated the same way a top-level Definition is.
+// Repeatable means the field's value is a list of component instances
+// rather than a single one.
+//
+// Components may not contain relation, component, or dynamic_zone
+// fields themselves: relations need a from_entry_id to key
+// entry_relations by, which a value nested inside JSONB never has one
+// of (see the package doc comment); nesting components/dynamic zones
+// inside components is deferred rather than designed, to keep the
+// first pass's recursion bounded to one level.
+type ComponentConfig struct {
+	Fields     []Field `json:"fields"`
+	Repeatable bool    `json:"repeatable"`
+}
+
+// DynamicZoneConfig describes a "dynamic_zone" field: an ordered list
+// of component instances, each tagged with which named component type
+// it is (Components keyed by that name). A dynamic zone is always a
+// list, never a single instance.
+type DynamicZoneConfig struct {
+	Components map[string]ComponentConfig `json:"components"`
+}
+
+// dynamicZoneComponentKey is the JSON key a dynamic zone's component
+// instances are tagged with to say which component in Components they
+// are an instance of.
+const dynamicZoneComponentKey = "__component"
+
 // reservedFieldNames collide with infrastructure columns/metadata and
 // can never be used as a content field's API name.
 var reservedFieldNames = map[string]bool{
@@ -144,6 +183,14 @@ type Field struct {
 	// Relation is required when Type == FieldRelation, and ignored
 	// otherwise.
 	Relation *RelationConfig `json:"relation,omitempty"`
+
+	// Component is required when Type == FieldComponent, and ignored
+	// otherwise.
+	Component *ComponentConfig `json:"component,omitempty"`
+
+	// DynamicZone is required when Type == FieldDynamicZone, and
+	// ignored otherwise.
+	DynamicZone *DynamicZoneConfig `json:"dynamicZone,omitempty"`
 }
 
 type Definition struct {
@@ -154,19 +201,31 @@ type Definition struct {
 // duplicate names, reserved names, invalid types, invalid enum config.
 // It does not look at any content.
 func (d Definition) Validate() error {
-	seen := map[string]bool{}
 	seenIDs := map[uuid.UUID]bool{}
-	for _, f := range d.Fields {
+	return validateFieldList(d.Fields, seenIDs)
+}
+
+// validateFieldList validates one set of fields — either a top-level
+// Definition's own Fields, or the nested Fields of a component/dynamic
+// zone's component. Field *names* only need to be unique within the
+// list being validated (a component's fields live in their own nested
+// JSON object, so they can't collide with the parent's); field *ids*
+// are tracked in the one seenIDs map passed all the way down, so an id
+// collision is caught no matter how deep the two colliding fields are
+// nested relative to each other.
+func validateFieldList(fields []Field, seenIDs map[uuid.UUID]bool) error {
+	seenNames := map[string]bool{}
+	for _, f := range fields {
 		if !apiNamePattern.MatchString(f.Name) {
 			return fmt.Errorf("field %q: name must start with a letter and contain only letters, digits, underscores", f.Name)
 		}
 		if reservedFieldNames[f.Name] {
 			return fmt.Errorf("field %q: name is reserved", f.Name)
 		}
-		if seen[f.Name] {
+		if seenNames[f.Name] {
 			return fmt.Errorf("field %q: duplicate field name", f.Name)
 		}
-		seen[f.Name] = true
+		seenNames[f.Name] = true
 
 		// A client may supply a field id explicitly (e.g. re-submitting
 		// a previously assigned one); what it may never do is supply
@@ -196,6 +255,49 @@ func (d Definition) Validate() error {
 			if f.Relation.OnDelete != "" && !validDeletePolicies[f.Relation.OnDelete] {
 				return fmt.Errorf("field %q: unknown onDelete policy %q", f.Name, f.Relation.OnDelete)
 			}
+		}
+		if f.Type == FieldComponent {
+			if f.Component == nil {
+				return fmt.Errorf("field %q: component fields require a component configuration", f.Name)
+			}
+			if err := rejectNestedContainers(f.Component.Fields); err != nil {
+				return fmt.Errorf("field %q: %w", f.Name, err)
+			}
+			if err := validateFieldList(f.Component.Fields, seenIDs); err != nil {
+				return fmt.Errorf("field %q: %w", f.Name, err)
+			}
+		}
+		if f.Type == FieldDynamicZone {
+			if f.DynamicZone == nil || len(f.DynamicZone.Components) == 0 {
+				return fmt.Errorf("field %q: dynamic_zone fields require at least one named component", f.Name)
+			}
+			for compName, cc := range f.DynamicZone.Components {
+				if !apiNamePattern.MatchString(compName) {
+					return fmt.Errorf("field %q: component name %q must start with a letter and contain only letters, digits, underscores", f.Name, compName)
+				}
+				if err := rejectNestedContainers(cc.Fields); err != nil {
+					return fmt.Errorf("field %q: component %q: %w", f.Name, compName, err)
+				}
+				if err := validateFieldList(cc.Fields, seenIDs); err != nil {
+					return fmt.Errorf("field %q: component %q: %w", f.Name, compName, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// rejectNestedContainers enforces the one-level-deep limit on
+// components/dynamic zones (see the package doc comment): none of a
+// component's own fields may themselves be a relation, a component, or
+// a dynamic zone.
+func rejectNestedContainers(fields []Field) error {
+	for _, f := range fields {
+		switch f.Type {
+		case FieldRelation:
+			return fmt.Errorf("nested field %q: relation fields are not allowed inside a component or dynamic zone", f.Name)
+		case FieldComponent, FieldDynamicZone:
+			return fmt.Errorf("nested field %q: components/dynamic zones may not themselves contain a component or dynamic zone", f.Name)
 		}
 	}
 	return nil
@@ -323,6 +425,72 @@ func validateField(f Field, value any) error {
 		}
 	case FieldRelation:
 		return validateRelationValue(f, value)
+	case FieldComponent:
+		return validateComponentValue(*f.Component, value)
+	case FieldDynamicZone:
+		return validateDynamicZoneValue(*f.DynamicZone, value)
+	}
+	return nil
+}
+
+// validateComponentValue checks a component field's value: a single
+// JSON object (validated against cc.Fields) or, if Repeatable, a list
+// of them.
+func validateComponentValue(cc ComponentConfig, value any) error {
+	if cc.Repeatable {
+		items, ok := value.([]any)
+		if !ok {
+			return fmt.Errorf("expected a list of component instances")
+		}
+		for i, item := range items {
+			obj, ok := item.(map[string]any)
+			if !ok {
+				return fmt.Errorf("item %d: expected a component instance object", i)
+			}
+			if err := (Definition{Fields: cc.Fields}).ValidateEntry(obj); err != nil {
+				return fmt.Errorf("item %d: %w", i, err)
+			}
+		}
+		return nil
+	}
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return fmt.Errorf("expected a component instance object")
+	}
+	return (Definition{Fields: cc.Fields}).ValidateEntry(obj)
+}
+
+// validateDynamicZoneValue checks a dynamic zone's value: a list of
+// JSON objects, each tagged with "__component" naming which of
+// dz.Components it's an instance of, and validated against that
+// component's own fields.
+func validateDynamicZoneValue(dz DynamicZoneConfig, value any) error {
+	items, ok := value.([]any)
+	if !ok {
+		return fmt.Errorf("expected a list of component instances")
+	}
+	for i, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			return fmt.Errorf("item %d: expected a component instance object", i)
+		}
+		name, ok := obj[dynamicZoneComponentKey].(string)
+		if !ok || name == "" {
+			return fmt.Errorf("item %d: missing or invalid %q", i, dynamicZoneComponentKey)
+		}
+		cc, ok := dz.Components[name]
+		if !ok {
+			return fmt.Errorf("item %d: %q is not one of this field's allowed components", i, name)
+		}
+		rest := make(map[string]any, len(obj)-1)
+		for k, v := range obj {
+			if k != dynamicZoneComponentKey {
+				rest[k] = v
+			}
+		}
+		if err := (Definition{Fields: cc.Fields}).ValidateEntry(rest); err != nil {
+			return fmt.Errorf("item %d (%s): %w", i, name, err)
+		}
 	}
 	return nil
 }

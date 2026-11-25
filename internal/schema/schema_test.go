@@ -86,6 +86,66 @@ func TestDefinitionValidate(t *testing.T) {
 				}},
 			}},
 		},
+		{
+			name: "valid component field",
+			def: Definition{Fields: []Field{
+				{Name: "address", Type: FieldComponent, Component: &ComponentConfig{
+					Fields: []Field{{Name: "street", Type: FieldShortText}},
+				}},
+			}},
+		},
+		{
+			name:    "component field missing configuration",
+			def:     Definition{Fields: []Field{{Name: "address", Type: FieldComponent}}},
+			wantErr: true,
+		},
+		{
+			name: "component may not nest a relation field",
+			def: Definition{Fields: []Field{
+				{Name: "address", Type: FieldComponent, Component: &ComponentConfig{
+					Fields: []Field{{Name: "owner", Type: FieldRelation, Relation: &RelationConfig{
+						TargetContentType: "author", RelationType: RelationManyToOne,
+					}}},
+				}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "component may not nest another component",
+			def: Definition{Fields: []Field{
+				{Name: "outer", Type: FieldComponent, Component: &ComponentConfig{
+					Fields: []Field{{Name: "inner", Type: FieldComponent, Component: &ComponentConfig{
+						Fields: []Field{{Name: "x", Type: FieldShortText}},
+					}}},
+				}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "duplicate field id across a component boundary is still rejected",
+			def: Definition{Fields: []Field{
+				{ID: fixedFieldID, Name: "top", Type: FieldShortText},
+				{Name: "box", Type: FieldComponent, Component: &ComponentConfig{
+					Fields: []Field{{ID: fixedFieldID, Name: "inner", Type: FieldShortText}},
+				}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "valid dynamic zone field",
+			def: Definition{Fields: []Field{
+				{Name: "sections", Type: FieldDynamicZone, DynamicZone: &DynamicZoneConfig{
+					Components: map[string]ComponentConfig{
+						"quote": {Fields: []Field{{Name: "text", Type: FieldShortText}}},
+					},
+				}},
+			}},
+		},
+		{
+			name:    "dynamic zone field with no components",
+			def:     Definition{Fields: []Field{{Name: "sections", Type: FieldDynamicZone, DynamicZone: &DynamicZoneConfig{}}}},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -135,6 +195,91 @@ func TestValidateEntry(t *testing.T) {
 		{name: "bad enum value", data: map[string]any{"title": "x", "state": "archived"}, wantErr: true},
 		{name: "good enum value", data: map[string]any{"title": "x", "state": "live"}},
 		{name: "wrong type for boolean", data: map[string]any{"title": "x", "published": "yes"}, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := def.ValidateEntry(tc.data)
+			if tc.wantErr && err == nil {
+				t.Fatalf("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateEntryComponentsAndDynamicZones(t *testing.T) {
+	def := Definition{Fields: []Field{
+		{Name: "title", Type: FieldShortText, Required: true},
+		{Name: "address", Type: FieldComponent, Component: &ComponentConfig{
+			Fields: []Field{
+				{Name: "street", Type: FieldShortText, Required: true},
+				{Name: "zip", Type: FieldShortText},
+			},
+		}},
+		{Name: "links", Type: FieldComponent, Component: &ComponentConfig{
+			Repeatable: true,
+			Fields:     []Field{{Name: "url", Type: FieldURL, Required: true}},
+		}},
+		{Name: "sections", Type: FieldDynamicZone, DynamicZone: &DynamicZoneConfig{
+			Components: map[string]ComponentConfig{
+				"quote": {Fields: []Field{{Name: "text", Type: FieldShortText, Required: true}}},
+				"image": {Fields: []Field{{Name: "url", Type: FieldURL, Required: true}}},
+			},
+		}},
+	}}
+
+	cases := []struct {
+		name    string
+		data    map[string]any
+		wantErr bool
+	}{
+		{
+			name: "valid component, repeatable component, and dynamic zone",
+			data: map[string]any{
+				"title":   "Hello",
+				"address": map[string]any{"street": "1 Main St"},
+				"links":   []any{map[string]any{"url": "https://example.com"}},
+				"sections": []any{
+					map[string]any{"__component": "quote", "text": "hi"},
+					map[string]any{"__component": "image", "url": "https://example.com/a.png"},
+				},
+			},
+		},
+		{
+			name: "component missing a required nested field",
+			data: map[string]any{
+				"title":   "Hello",
+				"address": map[string]any{},
+			},
+			wantErr: true,
+		},
+		{
+			name: "repeatable component given a single object instead of a list",
+			data: map[string]any{
+				"title": "Hello",
+				"links": map[string]any{"url": "https://example.com"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "dynamic zone item naming an unknown component",
+			data: map[string]any{
+				"title":    "Hello",
+				"sections": []any{map[string]any{"__component": "nope", "text": "hi"}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "dynamic zone item missing __component",
+			data: map[string]any{
+				"title":    "Hello",
+				"sections": []any{map[string]any{"text": "hi"}},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range cases {

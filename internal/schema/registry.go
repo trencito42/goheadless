@@ -101,11 +101,7 @@ func (r *Registry) Create(ctx context.Context, projectID uuid.UUID, apiID, displ
 	if err := def.Validate(); err != nil {
 		return ContentType{}, fmt.Errorf("invalid schema: %w", err)
 	}
-	for i, f := range def.Fields {
-		if f.ID == uuid.Nil {
-			def.Fields[i].ID = uuid.New()
-		}
-	}
+	assignFieldIDs(def.Fields)
 	for _, f := range def.RelationFields() {
 		if f.Relation.TargetContentType == apiID {
 			continue // self-referencing: the target is this content type itself.
@@ -143,6 +139,27 @@ func (r *Registry) Create(ctx context.Context, projectID uuid.UUID, apiID, displ
 	r.byKey[key(ct.ProjectID, ct.APIID)] = ct
 	r.mu.Unlock()
 	return ct, nil
+}
+
+// assignFieldIDs fills in a fresh id for every field in the tree
+// (including nested component/dynamic-zone fields) whose id is still
+// the zero UUID, in place. Called once, by Registry.Create, before a
+// new content type's schema is first persisted.
+func assignFieldIDs(fields []Field) {
+	for i := range fields {
+		if fields[i].ID == uuid.Nil {
+			fields[i].ID = uuid.New()
+		}
+		if fields[i].Component != nil {
+			assignFieldIDs(fields[i].Component.Fields)
+		}
+		if fields[i].DynamicZone != nil {
+			for name, cc := range fields[i].DynamicZone.Components {
+				assignFieldIDs(cc.Fields)
+				fields[i].DynamicZone.Components[name] = cc
+			}
+		}
+	}
 }
 
 type rowScanner interface {
