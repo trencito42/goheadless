@@ -1,6 +1,6 @@
 # PROGRESS
 
-Last updated: 2026-11-25 (RBAC pass).
+Last updated: 2026-11-25 (RBAC + tests pass).
 
 This tracks exactly what's real. "VERIFIED" means it was actually run and
 observed to work in this environment — not inferred from the code
@@ -99,9 +99,42 @@ Not done: no UI for member management yet (API only — the admin frontend
 has no page for it); no field-level permissions; no "author can only
 edit their own entries" check (author can create, but update/publish
 require editor regardless of who created the entry — simpler for now,
-tracked as a real gap, not an oversight); no cross-project access test
-*suite* (verified manually via curl this session, not via automated
-tests — see "Tests" below, which is still the biggest real gap).
+tracked as a real gap, not an oversight).
+
+## Tests — now real, IMPLEMENTED and VERIFIED
+
+- `internal/schema/schema_test.go` — table-driven unit tests for
+  `Definition.Validate` and `ValidateEntry` (schema validation, no
+  database needed).
+- `internal/auth/password_test.go` — Argon2id hash/verify roundtrip,
+  distinct-salt check, malformed-hash rejection.
+- `tests/integration/*_test.go` — real integration tests against a real
+  PostgreSQL database (`cms_test`, created alongside the dev `cms`
+  database; `TEST_DATABASE_URL` overrides it), wiring the actual router
+  and every real service (no mocks), driven through `httptest.Server` +
+  plain HTTP requests with manual cookie handling. Skips (not fails) if
+  the test database can't be reached. Covers: the full vertical slice
+  (project → content type → draft → publish → delivery visibility),
+  schema validation rejecting missing/unexpected fields through the real
+  HTTP path, owner-only routes rejecting a non-owner, and the RBAC suite
+  specifically asked for — cross-project isolation (non-member 403s and
+  sees an empty project list), the viewer/editor role floor, and
+  `created_by` attribution.
+- All of `go test ./...`, `go vet ./...`, and `gofmt -l .` are clean.
+- Caught one real bug writing these: the test client's cookie-jar logic
+  checked `resp.Cookies() != nil`, but `http.Response.Cookies()` returns
+  a non-nil *empty* slice when a response sets no cookies — so every
+  request after login was silently dropping the session cookie. Fixed to
+  check `len(cookies) > 0`. Noted here because it's a easy mistake to
+  make again in any other hand-rolled Go HTTP client/test code in this
+  repo.
+
+Still missing: `go test -race` was attempted but can't run in this
+environment (`-race` needs cgo, which needs a C compiler; none is
+installed) — needs a machine with gcc/clang, or that installed here,
+before it can run. No Playwright/Vitest for the frontend, no fuzz tests
+for the query parser (the query parser itself doesn't exist yet), no CI
+pipeline wiring any of this to run automatically on push.
 
 ## Known gaps / explicitly NOT_STARTED (tracked, not forgotten)
 
@@ -147,17 +180,16 @@ did not implement. None of it is silently dropped — it's the next work.
 
 ## Exact next steps
 
-1. Add a real test suite (Go `testing` + a real Postgres, Vitest for the
-   frontend) — now the most urgent gap. RBAC in particular was only
-   verified by hand this session; it needs automated regression tests
-   (especially cross-project access and role-floor tests) before the
-   surface area grows any further, or a future change could silently
-   reopen one of these checks.
-2. Extend the schema engine: relations next (needed by almost everything
+1. Extend the schema engine: relations next (needed by almost everything
    else — components, dynamic zones, and the query engine's expansion all
    depend on it), then media (single/multiple media fields need the media
-   library to exist first).
-3. Admin UI for member management (currently API-only).
+   library to exist first). Add integration tests for relations as they're
+   built, following the pattern in `tests/integration/`, not after.
+2. Admin UI for member management (currently API-only).
+3. Install a C compiler so `go test -race` can actually run, then run it.
 4. Get Docker Desktop actually usable (reboot to finish WSL2 setup), then
    verify `Dockerfile` and `deployments/docker-compose.dev.yml` actually
    build and run.
+5. Wire CI (even a minimal GitHub Actions workflow running `go test ./...`
+   against a Postgres service container, plus the frontend typecheck) —
+   there isn't one yet, so none of the above is enforced automatically.

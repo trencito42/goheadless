@@ -49,6 +49,28 @@ pending right now.
 
    Open http://localhost:5174 and sign in with the account from step 2.
 
+## Testing
+
+Unit tests need nothing extra:
+
+```powershell
+go test ./internal/...
+```
+
+Integration tests need a second database (`cms_test`, separate from the
+dev `cms` database so running tests never touches your dev data):
+
+```sql
+CREATE DATABASE cms_test OWNER cms;
+```
+
+```powershell
+$env:TEST_DATABASE_URL = "postgres://cms:cms_dev_password@localhost:5432/cms_test"
+go test ./...
+```
+
+They skip (rather than fail) if `cms_test` isn't reachable.
+
 ## Repository layout
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
