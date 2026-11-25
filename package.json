@@ -1,0 +1,14 @@
+{
+  "name": "strapi-killer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:design-system": "pnpm --filter @b4/tokens --filter @b4/motion --filter @b4/react run build",
+    "dev:admin": "pnpm --filter @b4/tokens --filter @b4/motion --filter @b4/react run build && pnpm --filter admin dev",
+    "build:admin": "pnpm build:design-system && pnpm --filter admin build"
+  }
+}
