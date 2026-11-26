@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Badge, Button, Card, Checkbox, EmptyState, Select, Tabs, TextField } from "@b4/react";
+import { Badge, Button, Card, Checkbox, DataTable, EmptyState, PageHeader, Select, Tabs, TextField } from "@b4/react";
 
 import { api, type ContentType, type FieldType, type Project, type SchemaField } from "../api/client";
 
@@ -23,11 +23,11 @@ export function ProjectDetail({ project, onBack }: { project: Project; onBack: (
   const [selected, setSelected] = useState<ContentType | null>(null);
 
   return (
-    <div style={{ padding: 24, display: "flex", flexDirection: "column", gap: 16 }}>
-      <button onClick={onBack} style={{ alignSelf: "flex-start", background: "none", border: "none", cursor: "pointer", fontSize: 13, opacity: 0.7 }}>
+    <div className="page-content">
+      <Button variant="ghost" size="sm" onClick={onBack} style={{ alignSelf: "flex-start" }}>
         ← All projects
-      </button>
-      <h1 style={{ fontSize: 22, margin: 0 }}>{project.name}</h1>
+      </Button>
+      <PageHeader title={project.name} description={project.slug} />
 
       <Tabs
         aria-label="Project sections"
@@ -163,16 +163,11 @@ function ContentTypeBuilder({
         <h2 style={{ fontSize: 15 }}>Existing content types</h2>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
           {contentTypesQuery.data?.map((ct) => (
-            <button
-              key={ct.id}
-              type="button"
-              onClick={() => onSelect(ct)}
-              style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}
-            >
+            <Button key={ct.id} type="button" variant="ghost" size="sm" onClick={() => onSelect(ct)}>
               <Badge>
                 {ct.displayName} ({ct.apiId})
               </Badge>
-            </button>
+            </Button>
           ))}
         </div>
       </div>
@@ -226,19 +221,21 @@ function ContentManager({ project, contentType }: { project: Project; contentTyp
         </form>
       </Card>
 
-      {entriesQuery.data?.data.length === 0 && (
+      {entriesQuery.data?.data.length === 0 ? (
         <EmptyState title="No entries yet" description="Create the first one above." />
-      )}
-
-      <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <tbody>
-          {entriesQuery.data?.data.map((entry) => (
-            <tr key={entry.id} style={{ borderBottom: "1px solid var(--b4-color-border, #333)" }}>
-              <td style={{ padding: 8 }}>{JSON.stringify(entry.data)}</td>
-              <td style={{ padding: 8 }}>
-                <Badge>{entry.status}</Badge>
-              </td>
-              <td style={{ padding: 8 }}>
+      ) : (
+        <DataTable
+          caption={`${contentType.displayName} entries`}
+          getRowId={(entry) => entry.id}
+          rows={entriesQuery.data?.data ?? []}
+          columns={[
+            { key: "data", header: "Data", render: (entry) => JSON.stringify(entry.data) },
+            { key: "status", header: "Status", render: (entry) => <Badge>{entry.status}</Badge> },
+            {
+              key: "actions",
+              header: "",
+              align: "end",
+              render: (entry) => (
                 <Button
                   size="sm"
                   variant="secondary"
@@ -247,11 +244,11 @@ function ContentManager({ project, contentType }: { project: Project; contentTyp
                 >
                   Publish
                 </Button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+              ),
+            },
+          ]}
+        />
+      )}
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Button, Card, EmptyState, TextField } from "@b4/react";
+import { Button, Card, EmptyState, InteractiveCard, PageHeader, TextField } from "@b4/react";
 
 import { api, type Project } from "../api/client";
 
@@ -20,8 +20,8 @@ export function Projects({ onOpenProject }: { onOpenProject: (p: Project) => voi
   });
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 24, padding: 24 }}>
-      <h1 style={{ fontSize: 22, margin: 0 }}>Projects</h1>
+    <div className="page-content">
+      <PageHeader title="Projects" description="Every project you own or have been added to." />
 
       <Card style={{ padding: 20, maxWidth: 480 }}>
         <h2 style={{ fontSize: 15, marginTop: 0 }}>New project</h2>
@@ -43,6 +43,11 @@ export function Projects({ onOpenProject }: { onOpenProject: (p: Project) => voi
           <Button type="submit" loading={createMutation.isPending}>
             Create project
           </Button>
+          {createMutation.isError && (
+            <p role="alert" style={{ color: "var(--b4-danger)", fontSize: 13 }}>
+              {(createMutation.error as Error).message}
+            </p>
+          )}
         </form>
       </Card>
 
@@ -52,14 +57,10 @@ export function Projects({ onOpenProject }: { onOpenProject: (p: Project) => voi
 
       <div style={{ display: "grid", gap: 12, gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))" }}>
         {projectsQuery.data?.map((p) => (
-          <Card
-            key={p.id}
-            style={{ padding: 16, cursor: "pointer" }}
-            onClick={() => onOpenProject(p)}
-          >
+          <InteractiveCard key={p.id} onClick={() => onOpenProject(p)}>
             <strong>{p.name}</strong>
             <div style={{ fontSize: 12, opacity: 0.7 }}>{p.slug}</div>
-          </Card>
+          </InteractiveCard>
         ))}
       </div>
     </div>

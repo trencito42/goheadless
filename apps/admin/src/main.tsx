@@ -6,6 +6,7 @@ import "@b4/tokens/css";
 import "@b4/tokens/css/graphite";
 import "@b4/tokens/css/porcelain";
 import "@b4/react/styles.css";
+import "./app.css";
 
 import { App } from "./App";
 

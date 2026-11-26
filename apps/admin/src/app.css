@@ -1,0 +1,10 @@
+/* Shared layout for every page's content area, rendered into AppShell's
+   children slot. Centralized here instead of repeating the same inline
+   padding/gap/max-width on every page component. */
+.page-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--b4-space-9);
+  padding: var(--b4-space-9);
+  max-inline-size: 960px;
+}
