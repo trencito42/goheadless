@@ -388,6 +388,46 @@ this specific environment. No Playwright/Vitest for the frontend, no
 fuzz tests for the query parser (the query parser itself doesn't exist
 yet).
 
+## Admin UI polish — IMPLEMENTED and VERIFIED
+
+- **b4 dropdown wrapping bug (global, user-reported)**: `Select`'s popup
+  CSS (`packages/b4/packages/react/src/components/Select/Select.css`)
+  fixed its width to `var(--anchor-width)` (the trigger's own width),
+  which is sized to the trigger's *selected* value, not the widest
+  option label — long labels (e.g. "Dynamic zone") wrapped letter by
+  letter. Fixed to `min-inline-size: var(--anchor-width)` +
+  `width: max-content` + `max-inline-size: var(--available-width)`.
+  `Combobox` and `MultiSelect` reuse the same `.b4-select__popup` class,
+  so this one fix covers all three. Committed and pushed in the `b4`
+  submodule (`6c2a72f`), submodule pointer bumped in this repo
+  (`368f095`). VERIFIED visually in the browser pane — option labels
+  now render on one line.
+- **Admin app was under-using the b4 component library**: it only used
+  `Card`, `Button`, `TextField`, `Badge`, `Select`, `Tabs`, `Checkbox`,
+  `EmptyState` — all raw-HTML/inline-styled for page headers, nav, and
+  tables (`<h1>`, `<nav><button>`, `<table>`, `<div onClick>`), which is
+  why it looked rudimentary next to what b4 actually offers. Swapped in:
+  - `PageHeader` for every page title (`Projects`, `ProjectDetail`)
+    instead of a bare inline-styled `<h1>`.
+  - `Sidebar` for the app nav (`App.tsx`) instead of a raw `<nav>` of
+    `<button>`s — real `aria-current="page"` on the active item.
+  - `InteractiveCard` for the clickable project list instead of `Card`
+    + manual `onClick`/`cursor:pointer`.
+  - `DataTable` for the content entries list instead of a raw
+    `<table>`.
+  - Added `apps/admin/src/app.css` (`.page-content` utility) instead of
+    repeating the same inline padding/gap/max-width on every page.
+  Files: `apps/admin/src/{App.tsx,main.tsx,app.css,pages/Projects.tsx,
+  pages/ProjectDetail.tsx}`. VERIFIED: `pnpm typecheck` clean, and both
+  the Projects page and a project's detail page (Blog) visually
+  confirmed in the browser pane against the real backend. Committed and
+  pushed (`35ec711`).
+  Still rudimentary / explicitly not touched by this pass: no new UI
+  surface area was added — relations picker, component/dynamic-zone
+  editing, and member management are still plain forms or missing
+  entirely (see "Exact next steps" below, item 4). This pass only
+  improved the visual quality of pages that already existed.
+
 ## Known gaps / explicitly NOT_STARTED (tracked, not forgotten)
 
 Everything below is real scope from the original spec that this session
